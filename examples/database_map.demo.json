@@ -1,0 +1,1418 @@
+{
+  "metadata": {
+    "blossa_version": "0.1.0",
+    "schema_name": "BLOSSA_DEMO",
+    "generated_at": "2026-06-20T21:47:32.803022Z",
+    "llm_provider": "heuristic",
+    "llm_model": null,
+    "profiling_enabled": true,
+    "table_count": 6
+  },
+  "schema_info": {
+    "name": "BLOSSA_DEMO",
+    "tables": [
+      {
+        "name": "STATUS_REF",
+        "comment": null,
+        "num_rows": 4,
+        "columns": [
+          {
+            "name": "STATUS_CD",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 2,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "DESCR",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 40,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_STATUS_REF",
+            "type": "P",
+            "columns": [
+              "STATUS_CD"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [],
+        "profiles": {
+          "STATUS_CD": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [
+              "*"
+            ],
+            "is_low_cardinality": true
+          },
+          "DESCR": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": 3,
+            "max_length": 9,
+            "value_patterns": [
+              "A{3}",
+              "A{6}"
+            ],
+            "masked_samples": [
+              "N**",
+              "S*****D"
+            ],
+            "is_low_cardinality": true
+          }
+        }
+      },
+      {
+        "name": "CUSTOMERS",
+        "comment": "Master record of customers placing orders.",
+        "num_rows": 4,
+        "columns": [
+          {
+            "name": "CUST_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": "Surrogate primary key for a customer."
+          },
+          {
+            "name": "NAME",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 120,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "EMAIL",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 120,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": true,
+            "data_default": null,
+            "comment": "Primary contact email address."
+          },
+          {
+            "name": "PHONE",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 30,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "CREATED_DT",
+            "column_id": 0,
+            "data_type": "DATE",
+            "data_length": null,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "STATUS_CD",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 2,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_CUSTOMERS",
+            "type": "P",
+            "columns": [
+              "CUST_ID"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [],
+        "profiles": {
+          "CUST_ID": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{4}"
+            ],
+            "masked_samples": [
+              "1**1",
+              "1**2"
+            ],
+            "is_low_cardinality": false
+          },
+          "NAME": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": 14,
+            "max_length": 19,
+            "value_patterns": [
+              "A{4} A{7} A{3}"
+            ],
+            "masked_samples": [
+              "A*************L",
+              "C************u"
+            ],
+            "is_low_cardinality": false
+          },
+          "EMAIL": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "email"
+            ],
+            "masked_samples": [
+              "o***@a***.example",
+              "c***@m***.example"
+            ],
+            "is_low_cardinality": false
+          },
+          "PHONE": {
+            "total_rows": 4,
+            "null_count": 1,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "+99 99 999 9999",
+              "+99 999 999 999"
+            ],
+            "masked_samples": [
+              "+*************1",
+              "+************3"
+            ],
+            "is_low_cardinality": false
+          },
+          "CREATED_DT": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 1,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "date"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "STATUS_CD": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [
+              "*"
+            ],
+            "is_low_cardinality": true
+          }
+        }
+      },
+      {
+        "name": "PRODUCTS",
+        "comment": null,
+        "num_rows": 4,
+        "columns": [
+          {
+            "name": "PROD_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "SKU",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 20,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "DESCR",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 200,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "PRICE",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": 2,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "CAT_CD",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 4,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_PRODUCTS",
+            "type": "P",
+            "columns": [
+              "PROD_ID"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          },
+          {
+            "name": "UQ_PRODUCTS_SKU",
+            "type": "U",
+            "columns": [
+              "SKU"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [],
+        "profiles": {
+          "PROD_ID": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{2}"
+            ],
+            "masked_samples": [
+              "*"
+            ],
+            "is_low_cardinality": false
+          },
+          "SKU": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": 11,
+            "max_length": 11,
+            "value_patterns": [
+              "A{3}-A{3}-9{3}"
+            ],
+            "masked_samples": [
+              "S*********1",
+              "S*********2"
+            ],
+            "is_low_cardinality": false
+          },
+          "DESCR": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "A{6}, A{8}",
+              "A{5}, A{4}"
+            ],
+            "masked_samples": [
+              "W*************d",
+              "G********e"
+            ],
+            "is_low_cardinality": false
+          },
+          "PRICE": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9.99",
+              "99.99"
+            ],
+            "masked_samples": [
+              "1***9",
+              "3***9"
+            ],
+            "is_low_cardinality": false
+          },
+          "CAT_CD": {
+            "total_rows": 4,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "A{3}"
+            ],
+            "masked_samples": [
+              "W*D",
+              "G*Z"
+            ],
+            "is_low_cardinality": true
+          }
+        }
+      },
+      {
+        "name": "ORDERS",
+        "comment": null,
+        "num_rows": 3,
+        "columns": [
+          {
+            "name": "ORDER_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 12,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "CUST_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "ORDER_DATE",
+            "column_id": 0,
+            "data_type": "DATE",
+            "data_length": null,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "TOTAL_AMT",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 12,
+            "data_scale": 2,
+            "nullable": true,
+            "data_default": null,
+            "comment": "Order gross total in account currency."
+          },
+          {
+            "name": "STATUS_CD",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 2,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_ORDERS",
+            "type": "P",
+            "columns": [
+              "ORDER_ID"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          },
+          {
+            "name": "FK_ORDERS_CUST",
+            "type": "R",
+            "columns": [
+              "CUST_ID"
+            ],
+            "referenced_table": "CUSTOMERS",
+            "referenced_columns": [
+              "CUST_ID"
+            ],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [],
+        "profiles": {
+          "ORDER_ID": {
+            "total_rows": 3,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{6}"
+            ],
+            "masked_samples": [
+              "9****1"
+            ],
+            "is_low_cardinality": false
+          },
+          "CUST_ID": {
+            "total_rows": 3,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{4}"
+            ],
+            "masked_samples": [
+              "1**1"
+            ],
+            "is_low_cardinality": false
+          },
+          "ORDER_DATE": {
+            "total_rows": 3,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "date"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "TOTAL_AMT": {
+            "total_rows": 3,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "99.99",
+              "99.99"
+            ],
+            "masked_samples": [
+              "5***8"
+            ],
+            "is_low_cardinality": false
+          },
+          "STATUS_CD": {
+            "total_rows": 3,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [
+              "*"
+            ],
+            "is_low_cardinality": true
+          }
+        }
+      },
+      {
+        "name": "ORDER_ITEMS",
+        "comment": null,
+        "num_rows": 5,
+        "columns": [
+          {
+            "name": "ITEM_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 12,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "ORDER_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 12,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "PROD_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "QTY",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 6,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "UNIT_PRICE",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 10,
+            "data_scale": 2,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_ORDER_ITEMS",
+            "type": "P",
+            "columns": [
+              "ITEM_ID"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          },
+          {
+            "name": "FK_ITEMS_ORDER",
+            "type": "R",
+            "columns": [
+              "ORDER_ID"
+            ],
+            "referenced_table": "ORDERS",
+            "referenced_columns": [
+              "ORDER_ID"
+            ],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [
+          {
+            "name": "IX_ITEMS_PROD",
+            "unique": false,
+            "columns": [
+              "PROD_ID"
+            ]
+          }
+        ],
+        "profiles": {
+          "ITEM_ID": {
+            "total_rows": 5,
+            "null_count": 0,
+            "distinct_count": 5,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "ORDER_ID": {
+            "total_rows": 5,
+            "null_count": 0,
+            "distinct_count": 3,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{6}"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "PROD_ID": {
+            "total_rows": 5,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{2}"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "QTY": {
+            "total_rows": 5,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": true
+          },
+          "UNIT_PRICE": {
+            "total_rows": 5,
+            "null_count": 0,
+            "distinct_count": 4,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "99.99"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          }
+        }
+      },
+      {
+        "name": "CUST_NOTES",
+        "comment": null,
+        "num_rows": 2,
+        "columns": [
+          {
+            "name": "NOTE_ID",
+            "column_id": 0,
+            "data_type": "NUMBER",
+            "data_length": null,
+            "data_precision": 12,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "CUST_ID",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 20,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": false,
+            "data_default": null,
+            "comment": null
+          },
+          {
+            "name": "NOTE_TXT",
+            "column_id": 0,
+            "data_type": "VARCHAR2",
+            "data_length": 400,
+            "data_precision": null,
+            "data_scale": null,
+            "nullable": true,
+            "data_default": null,
+            "comment": null
+          }
+        ],
+        "constraints": [
+          {
+            "name": "PK_CUST_NOTES",
+            "type": "P",
+            "columns": [
+              "NOTE_ID"
+            ],
+            "referenced_table": null,
+            "referenced_columns": [],
+            "search_condition": null,
+            "status": null
+          }
+        ],
+        "indexes": [],
+        "profiles": {
+          "NOTE_ID": {
+            "total_rows": 2,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9"
+            ],
+            "masked_samples": [],
+            "is_low_cardinality": false
+          },
+          "CUST_ID": {
+            "total_rows": 2,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "9{4}"
+            ],
+            "masked_samples": [
+              "1**1",
+              "1**3"
+            ],
+            "is_low_cardinality": false
+          },
+          "NOTE_TXT": {
+            "total_rows": 2,
+            "null_count": 0,
+            "distinct_count": 2,
+            "min_length": null,
+            "max_length": null,
+            "value_patterns": [
+              "A{3}-99 A{5} A{6}."
+            ],
+            "masked_samples": [
+              "N*****************d"
+            ],
+            "is_low_cardinality": false
+          }
+        }
+      }
+    ]
+  },
+  "relationships": [
+    {
+      "from_table": "ORDERS",
+      "from_columns": [
+        "CUST_ID"
+      ],
+      "to_table": "CUSTOMERS",
+      "to_columns": [
+        "CUST_ID"
+      ],
+      "declared": true,
+      "confidence": "high",
+      "evidence": [
+        "Declared foreign key constraint FK_ORDERS_CUST."
+      ]
+    },
+    {
+      "from_table": "ORDER_ITEMS",
+      "from_columns": [
+        "ORDER_ID"
+      ],
+      "to_table": "ORDERS",
+      "to_columns": [
+        "ORDER_ID"
+      ],
+      "declared": true,
+      "confidence": "high",
+      "evidence": [
+        "Declared foreign key constraint FK_ITEMS_ORDER."
+      ]
+    },
+    {
+      "from_table": "CUSTOMERS",
+      "from_columns": [
+        "STATUS_CD"
+      ],
+      "to_table": "STATUS_REF",
+      "to_columns": [
+        "STATUS_CD"
+      ],
+      "declared": false,
+      "confidence": "low",
+      "evidence": [
+        "Column name matches STATUS_REF.STATUS_CD (a key column)."
+      ]
+    },
+    {
+      "from_table": "ORDERS",
+      "from_columns": [
+        "STATUS_CD"
+      ],
+      "to_table": "STATUS_REF",
+      "to_columns": [
+        "STATUS_CD"
+      ],
+      "declared": false,
+      "confidence": "low",
+      "evidence": [
+        "Column name matches STATUS_REF.STATUS_CD (a key column)."
+      ]
+    },
+    {
+      "from_table": "ORDER_ITEMS",
+      "from_columns": [
+        "PROD_ID"
+      ],
+      "to_table": "PRODUCTS",
+      "to_columns": [
+        "PROD_ID"
+      ],
+      "declared": false,
+      "confidence": "low",
+      "evidence": [
+        "Column name matches PRODUCTS.PROD_ID (a key column)."
+      ]
+    },
+    {
+      "from_table": "CUST_NOTES",
+      "from_columns": [
+        "CUST_ID"
+      ],
+      "to_table": "CUSTOMERS",
+      "to_columns": [
+        "CUST_ID"
+      ],
+      "declared": false,
+      "confidence": "low",
+      "evidence": [
+        "Column name matches CUSTOMERS.CUST_ID (a key column).",
+        "Type differs: VARCHAR2(20) vs NUMBER(10,0) (compared as text)."
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "kind": "undeclared_fk_candidate",
+      "severity": "notice",
+      "table": "CUSTOMERS",
+      "columns": [
+        "STATUS_CD"
+      ],
+      "message": "Likely undeclared foreign key: CUSTOMERS.STATUS_CD -> STATUS_REF.STATUS_CD (low confidence).",
+      "details": {}
+    },
+    {
+      "kind": "undeclared_fk_candidate",
+      "severity": "notice",
+      "table": "ORDERS",
+      "columns": [
+        "STATUS_CD"
+      ],
+      "message": "Likely undeclared foreign key: ORDERS.STATUS_CD -> STATUS_REF.STATUS_CD (low confidence).",
+      "details": {}
+    },
+    {
+      "kind": "undeclared_fk_candidate",
+      "severity": "notice",
+      "table": "ORDER_ITEMS",
+      "columns": [
+        "PROD_ID"
+      ],
+      "message": "Likely undeclared foreign key: ORDER_ITEMS.PROD_ID -> PRODUCTS.PROD_ID (low confidence).",
+      "details": {}
+    },
+    {
+      "kind": "undeclared_fk_candidate",
+      "severity": "notice",
+      "table": "CUST_NOTES",
+      "columns": [
+        "CUST_ID"
+      ],
+      "message": "Likely undeclared foreign key: CUST_NOTES.CUST_ID -> CUSTOMERS.CUST_ID (low confidence).",
+      "details": {}
+    },
+    {
+      "kind": "type_inconsistency",
+      "severity": "warning",
+      "table": null,
+      "columns": [
+        "CUST_ID"
+      ],
+      "message": "Column 'CUST_ID' has inconsistent types across tables: NUMBER in CUSTOMERS, ORDERS; VARCHAR2 in CUST_NOTES.",
+      "details": {}
+    },
+    {
+      "kind": "naming_inconsistency",
+      "severity": "notice",
+      "table": null,
+      "columns": [],
+      "message": "Mixed naming convention '_DT' vs '_DATE': CREATED_DT alongside ORDER_DATE.",
+      "details": {}
+    },
+    {
+      "kind": "missing_table_comment",
+      "severity": "info",
+      "table": "STATUS_REF",
+      "columns": [],
+      "message": "Table 'STATUS_REF' has no comment.",
+      "details": {}
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "STATUS_REF",
+      "columns": [
+        "STATUS_CD",
+        "DESCR"
+      ],
+      "message": "2 of 2 columns in 'STATUS_REF' have no comment.",
+      "details": {
+        "uncommented": 2,
+        "total": 2
+      }
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "CUSTOMERS",
+      "columns": [
+        "NAME",
+        "PHONE",
+        "CREATED_DT",
+        "STATUS_CD"
+      ],
+      "message": "4 of 6 columns in 'CUSTOMERS' have no comment.",
+      "details": {
+        "uncommented": 4,
+        "total": 6
+      }
+    },
+    {
+      "kind": "missing_table_comment",
+      "severity": "info",
+      "table": "PRODUCTS",
+      "columns": [],
+      "message": "Table 'PRODUCTS' has no comment.",
+      "details": {}
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "PRODUCTS",
+      "columns": [
+        "PROD_ID",
+        "SKU",
+        "DESCR",
+        "PRICE",
+        "CAT_CD"
+      ],
+      "message": "5 of 5 columns in 'PRODUCTS' have no comment.",
+      "details": {
+        "uncommented": 5,
+        "total": 5
+      }
+    },
+    {
+      "kind": "missing_table_comment",
+      "severity": "info",
+      "table": "ORDERS",
+      "columns": [],
+      "message": "Table 'ORDERS' has no comment.",
+      "details": {}
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "ORDERS",
+      "columns": [
+        "ORDER_ID",
+        "CUST_ID",
+        "ORDER_DATE",
+        "STATUS_CD"
+      ],
+      "message": "4 of 5 columns in 'ORDERS' have no comment.",
+      "details": {
+        "uncommented": 4,
+        "total": 5
+      }
+    },
+    {
+      "kind": "missing_table_comment",
+      "severity": "info",
+      "table": "ORDER_ITEMS",
+      "columns": [],
+      "message": "Table 'ORDER_ITEMS' has no comment.",
+      "details": {}
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "ORDER_ITEMS",
+      "columns": [
+        "ITEM_ID",
+        "ORDER_ID",
+        "PROD_ID",
+        "QTY",
+        "UNIT_PRICE"
+      ],
+      "message": "5 of 5 columns in 'ORDER_ITEMS' have no comment.",
+      "details": {
+        "uncommented": 5,
+        "total": 5
+      }
+    },
+    {
+      "kind": "missing_table_comment",
+      "severity": "info",
+      "table": "CUST_NOTES",
+      "columns": [],
+      "message": "Table 'CUST_NOTES' has no comment.",
+      "details": {}
+    },
+    {
+      "kind": "missing_column_comment",
+      "severity": "info",
+      "table": "CUST_NOTES",
+      "columns": [
+        "NOTE_ID",
+        "CUST_ID",
+        "NOTE_TXT"
+      ],
+      "message": "3 of 3 columns in 'CUST_NOTES' have no comment.",
+      "details": {
+        "uncommented": 3,
+        "total": 3
+      }
+    }
+  ],
+  "semantics": [
+    {
+      "table": "STATUS_REF",
+      "purpose": "Likely a master/reference entity ('status ref') referenced by other tables.",
+      "confidence": "medium",
+      "evidence": [
+        "Referenced by 2 relationship(s) from other tables."
+      ],
+      "columns": [
+        {
+          "column": "STATUS_CD",
+          "meaning": "Primary key — unique identifier for a status ref row.",
+          "confidence": "high",
+          "evidence": [
+            "Part of the primary key."
+          ]
+        },
+        {
+          "column": "DESCR",
+          "meaning": "Likely free-text description.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'DESCR'.",
+            "Observed value pattern(s): A{3}, A{6}."
+          ]
+        }
+      ]
+    },
+    {
+      "table": "CUSTOMERS",
+      "purpose": "Master record of customers placing orders.",
+      "confidence": "high",
+      "evidence": [
+        "Existing table comment."
+      ],
+      "columns": [
+        {
+          "column": "CUST_ID",
+          "meaning": "Surrogate primary key for a customer.",
+          "confidence": "high",
+          "evidence": [
+            "Documented by an existing column comment."
+          ]
+        },
+        {
+          "column": "NAME",
+          "meaning": "Likely a name / label.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'NAME'.",
+            "Observed value pattern(s): A{4} A{7} A{3}."
+          ]
+        },
+        {
+          "column": "EMAIL",
+          "meaning": "Primary contact email address.",
+          "confidence": "high",
+          "evidence": [
+            "Documented by an existing column comment."
+          ]
+        },
+        {
+          "column": "PHONE",
+          "meaning": "Likely a phone number.",
+          "confidence": "high",
+          "evidence": [
+            "Column name contains 'PHONE'.",
+            "Observed value pattern(s): +99 99 999 9999, +99 999 999 999."
+          ]
+        },
+        {
+          "column": "CREATED_DT",
+          "meaning": "Likely a date / timestamp.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'CREATED'.",
+            "Observed value pattern(s): date."
+          ]
+        },
+        {
+          "column": "STATUS_CD",
+          "meaning": "Foreign key referencing STATUS_REF.STATUS_CD (inferred relationship).",
+          "confidence": "medium",
+          "evidence": [
+            "References STATUS_REF.STATUS_CD (inferred)."
+          ]
+        }
+      ]
+    },
+    {
+      "table": "PRODUCTS",
+      "purpose": "Likely a master/reference entity ('product') referenced by other tables.",
+      "confidence": "medium",
+      "evidence": [
+        "Referenced by 1 relationship(s) from other tables."
+      ],
+      "columns": [
+        {
+          "column": "PROD_ID",
+          "meaning": "Primary key — unique identifier for a product row.",
+          "confidence": "high",
+          "evidence": [
+            "Part of the primary key."
+          ]
+        },
+        {
+          "column": "SKU",
+          "meaning": "Likely a stock-keeping unit code.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'SKU'.",
+            "Observed value pattern(s): A{3}-A{3}-9{3}."
+          ]
+        },
+        {
+          "column": "DESCR",
+          "meaning": "Likely free-text description.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'DESCR'.",
+            "Observed value pattern(s): A{6}, A{8}, A{5}, A{4}."
+          ]
+        },
+        {
+          "column": "PRICE",
+          "meaning": "Likely a monetary amount.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'PRICE'.",
+            "Observed value pattern(s): 9.99, 99.99."
+          ]
+        },
+        {
+          "column": "CAT_CD",
+          "meaning": "Likely a classification code.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'CAT'.",
+            "Observed value pattern(s): A{3}."
+          ]
+        }
+      ]
+    },
+    {
+      "table": "ORDERS",
+      "purpose": "Likely a transactional / associative table linking CUSTOMERS, STATUS_REF.",
+      "confidence": "medium",
+      "evidence": [
+        "2 of 5 columns are foreign keys."
+      ],
+      "columns": [
+        {
+          "column": "ORDER_ID",
+          "meaning": "Primary key — unique identifier for a order row.",
+          "confidence": "high",
+          "evidence": [
+            "Part of the primary key."
+          ]
+        },
+        {
+          "column": "CUST_ID",
+          "meaning": "Foreign key referencing CUSTOMERS.CUST_ID.",
+          "confidence": "high",
+          "evidence": [
+            "References CUSTOMERS.CUST_ID."
+          ]
+        },
+        {
+          "column": "ORDER_DATE",
+          "meaning": "Likely a date / timestamp.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'DATE'.",
+            "Observed value pattern(s): date."
+          ]
+        },
+        {
+          "column": "TOTAL_AMT",
+          "meaning": "Order gross total in account currency.",
+          "confidence": "high",
+          "evidence": [
+            "Documented by an existing column comment."
+          ]
+        },
+        {
+          "column": "STATUS_CD",
+          "meaning": "Foreign key referencing STATUS_REF.STATUS_CD (inferred relationship).",
+          "confidence": "medium",
+          "evidence": [
+            "References STATUS_REF.STATUS_CD (inferred)."
+          ]
+        }
+      ]
+    },
+    {
+      "table": "ORDER_ITEMS",
+      "purpose": "Likely a transactional / associative table linking ORDERS, PRODUCTS.",
+      "confidence": "medium",
+      "evidence": [
+        "2 of 5 columns are foreign keys."
+      ],
+      "columns": [
+        {
+          "column": "ITEM_ID",
+          "meaning": "Primary key — unique identifier for a order item row.",
+          "confidence": "high",
+          "evidence": [
+            "Part of the primary key."
+          ]
+        },
+        {
+          "column": "ORDER_ID",
+          "meaning": "Foreign key referencing ORDERS.ORDER_ID.",
+          "confidence": "high",
+          "evidence": [
+            "References ORDERS.ORDER_ID."
+          ]
+        },
+        {
+          "column": "PROD_ID",
+          "meaning": "Foreign key referencing PRODUCTS.PROD_ID (inferred relationship).",
+          "confidence": "medium",
+          "evidence": [
+            "References PRODUCTS.PROD_ID (inferred)."
+          ]
+        },
+        {
+          "column": "QTY",
+          "meaning": "Likely a quantity / count.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'QTY'.",
+            "Observed value pattern(s): 9."
+          ]
+        },
+        {
+          "column": "UNIT_PRICE",
+          "meaning": "Likely a monetary amount.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'PRICE'.",
+            "Observed value pattern(s): 99.99."
+          ]
+        }
+      ]
+    },
+    {
+      "table": "CUST_NOTES",
+      "purpose": "Likely a small lookup / code table describing 'cust note' values.",
+      "confidence": "low",
+      "evidence": [
+        "Few columns with a primary key — typical of a lookup table."
+      ],
+      "columns": [
+        {
+          "column": "NOTE_ID",
+          "meaning": "Primary key — unique identifier for a cust note row.",
+          "confidence": "high",
+          "evidence": [
+            "Part of the primary key."
+          ]
+        },
+        {
+          "column": "CUST_ID",
+          "meaning": "Foreign key referencing CUSTOMERS.CUST_ID (inferred relationship).",
+          "confidence": "medium",
+          "evidence": [
+            "References CUSTOMERS.CUST_ID (inferred)."
+          ]
+        },
+        {
+          "column": "NOTE_TXT",
+          "meaning": "Likely free-text description.",
+          "confidence": "medium",
+          "evidence": [
+            "Column name contains 'TXT'.",
+            "Observed value pattern(s): A{3}-99 A{5} A{6}.."
+          ]
+        }
+      ]
+    }
+  ]
+}

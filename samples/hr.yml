@@ -1,0 +1,15 @@
+# Config for scanning the Oracle HR sample schema (see samples/README.md).
+# Adjust the password to whatever you set when installing the HR sample.
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "HR"
+  password: "oracle"
+  schema: "HR"
+
+llm:
+  # Use "heuristic" for a fast, offline baseline; switch to "ollama" for the real semantic pass.
+  provider: "heuristic"
+
+output:
+  dir: "samples/out"
+  name: "hr_map"

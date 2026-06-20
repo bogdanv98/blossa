@@ -114,8 +114,24 @@ blossa scan --demo --llm-provider heuristic
 | `blossa scan --demo` | Run against the bundled offline fixture (no Oracle needed). |
 | `blossa introspect` | Just dump the raw introspected schema as JSON (no checks, no LLM). |
 | `blossa check-llm` | Verify the configured LLM provider is reachable. |
+| `blossa ground-truth` | Capture real comments + FKs from a documented schema (for evaluation). |
+| `blossa eval` | Score a scan against ground truth: FK rediscovery + documentation coverage. |
 
 Run `blossa --help` for all flags.
+
+## See an example
+
+A full generated database map (from the bundled demo schema) is committed so you can see the output
+before running anything: **[examples/database_map.demo.md](examples/database_map.demo.md)** (and the
+machine-readable [JSON](examples/database_map.demo.json)).
+
+## Measure it on a real schema
+
+How good is the reconstruction, really? Blossa can be scored against a *documented* schema used as
+ground truth: capture the real comments + FKs, strip them to simulate a legacy estate, scan, and
+measure how much Blossa recovers (FK rediscovery rate + documentation coverage). See
+**[samples/README.md](samples/README.md)** for the full workflow against the official Oracle sample
+schemas (HR / OE).
 
 ## Scope (MVP)
 

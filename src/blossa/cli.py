@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
@@ -18,7 +19,9 @@ from .db.connection import Database
 from .db.introspect import introspect_schema
 from .diagnostics import Status, run_diagnostics
 from .diagnostics import check_llm as diag_check_llm
+from .evaluation import build_ground_truth, evaluate
 from .llm import get_provider
+from .models import ScanReport
 from .pipeline import run_scan_over_schema, scan_oracle
 from .render import write_json, write_markdown
 
@@ -253,6 +256,83 @@ def init(
         console.print("  [dim]Set the password before scanning:[/dim] "
                       "export BLOSSA_ORACLE__PASSWORD=...")
     console.print("  Next: [cyan]blossa doctor[/cyan]  then  [cyan]blossa scan[/cyan]")
+
+
+@app.command("ground-truth")
+def ground_truth(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a config file."),
+    output: Path = typer.Option(
+        Path("ground_truth.json"), "--output", "-o", help="Where to write the ground-truth JSON."
+    ),
+) -> None:
+    """Capture real comments + foreign keys from a documented schema (for later evaluation).
+
+    Run this BEFORE stripping docs / dropping FKs, so you have a baseline to evaluate against.
+    """
+    settings = load_settings(config)
+    try:
+        with Database(settings.oracle) as db:
+            schema = introspect_schema(db, db.effective_schema)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Ground-truth capture failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    truth = build_ground_truth(schema)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(truth, indent=2, ensure_ascii=False), encoding="utf-8")
+    n_tables = len(truth["tables"])
+    n_fks = sum(len(t["foreign_keys"]) for t in truth["tables"].values())
+    console.print(f"[bold green]Wrote[/bold green] {output} "
+                  f"({n_tables} tables, {n_fks} foreign keys captured).")
+
+
+@app.command("eval")
+def eval_cmd(
+    truth: Path = typer.Option(..., "--truth", "-t", help="Ground-truth JSON from `ground-truth`."),
+    scan_json: Path = typer.Option(
+        Path("out/database_map.json"), "--scan", "-s", help="The scan's JSON artifact."
+    ),
+) -> None:
+    """Score a scan against ground truth: FK rediscovery + documentation coverage."""
+    try:
+        truth_data = json.loads(truth.read_text(encoding="utf-8"))
+        report = ScanReport.model_validate_json(scan_json.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Could not load inputs:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    result = evaluate(truth_data, report)
+
+    table = Table(title=f"blossa eval - {result.schema_name}")
+    table.add_column("Metric", style="bold")
+    table.add_column("Score", justify="right")
+    table.add_column("Detail")
+    table.add_row(
+        "FK rediscovery (recall)",
+        f"{result.fk.recall:.0%}",
+        f"{result.fk.matched}/{result.fk.truth_total} real FKs re-found",
+    )
+    table.add_row(
+        "FK precision",
+        f"{result.fk.precision:.0%}",
+        f"{result.fk.matched}/{result.fk.found_total} inferred are real",
+    )
+    td, cd = result.table_docs, result.column_docs
+    table.add_row(
+        "Table doc coverage",
+        f"{td.coverage:.0%}",
+        f"{td.recovered}/{td.documented} documented tables got a meaning",
+    )
+    table.add_row(
+        "Column doc coverage",
+        f"{cd.coverage:.0%}",
+        f"{cd.recovered}/{cd.documented} documented columns got a meaning",
+    )
+    console.print(table)
+    if result.fk.missed:
+        console.print("[dim]Real FKs not rediscovered:[/dim]")
+        for m in result.fk.missed:
+            console.print(f"  - {m}")
 
 
 def main() -> None:  # pragma: no cover - entry shim

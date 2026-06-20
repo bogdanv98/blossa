@@ -1,0 +1,33 @@
+# Local Oracle XE with the synthetic BLOSSA_DEMO schema, for development only.
+#
+#   docker compose up -d
+#   # wait until healthy, then:
+#   export BLOSSA_ORACLE__PASSWORD=blossa_demo
+#   blossa scan
+#
+# Connection (matches blossa.yml defaults):
+#   dsn   = localhost:1521/XEPDB1
+#   user  = blossa_demo  /  password = blossa_demo
+#
+# NOTE: this is throwaway synthetic data. Never point this at real / production data.
+
+services:
+  oracle:
+    image: gvenzl/oracle-xe:21-slim
+    container_name: blossa-oracle
+    ports:
+      - "1521:1521"
+    environment:
+      # SYS / SYSTEM password (admin). Not used by Blossa, which connects as the app user.
+      ORACLE_PASSWORD: oracle
+      # Application user + its own schema, auto-created in the XEPDB1 pluggable database.
+      APP_USER: blossa_demo
+      APP_USER_PASSWORD: blossa_demo
+    volumes:
+      # *.sql here run once, as APP_USER, right after the database is created.
+      - ./init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30

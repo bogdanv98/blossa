@@ -1,0 +1,48 @@
+# Blossa configuration (example).
+# Copy to blossa.local.yml for local credentials — blossa.local.yml is git-ignored.
+# Every value can also be overridden by an environment variable (BLOSSA_*) or a CLI flag.
+
+# --- Database connection (READ-ONLY) ---------------------------------------
+oracle:
+  # python-oracledb thin mode — no Oracle Instant Client required.
+  # DSN forms: "host:port/service_name"  e.g. "localhost:1521/XEPDB1"
+  dsn: "localhost:1521/XEPDB1"
+  user: "blossa_demo"
+  # Prefer the BLOSSA_ORACLE__PASSWORD env var over storing this in a file.
+  password: "blossa_demo"
+  # Schema (owner) to introspect. Defaults to the connecting user if omitted.
+  schema: "BLOSSA_DEMO"
+
+# --- LLM provider (semantic pass) ------------------------------------------
+llm:
+  # provider: "ollama" | "heuristic" | "openai_compatible"
+  # "heuristic" runs fully offline with no model — useful for CI / a first run.
+  provider: "ollama"
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "qwen2.5:14b"
+    # Hard timeout per request (seconds).
+    timeout: 120
+  openai_compatible:
+    base_url: "http://localhost:8000/v1"
+    model: "local-model"
+    # api_key via BLOSSA_LLM__OPENAI_COMPATIBLE__API_KEY if the endpoint needs one.
+    api_key: ""
+    timeout: 120
+
+# --- Scan behaviour --------------------------------------------------------
+scan:
+  # Cap profiling work on very wide schemas (0 = no limit).
+  max_tables: 0
+  # Sample size per column for value-pattern / distinct-count profiling.
+  sample_rows: 1000
+  # Value-overlap threshold (0..1) for flagging an undeclared/candidate FK.
+  candidate_fk_overlap: 0.85
+  # Skip data profiling entirely (structure + comments only).
+  skip_profiling: false
+
+# --- Output ----------------------------------------------------------------
+output:
+  dir: "out"
+  # Base filename (without extension) for the .md and .json artifacts.
+  name: "database_map"

@@ -86,6 +86,29 @@ def _single_col_keys(schema: SchemaInfo) -> dict[str, tuple[str, str]]:
     return keys
 
 
+def _single_col_key_list(schema: SchemaInfo) -> list[tuple[str, str, str]]:
+    """Every single-column PK/unique key as (table, column, base_type), for suffix matching."""
+    keys: list[tuple[str, str, str]] = []
+    for table in schema.tables:
+        for c in table.constraints:
+            is_key = c.type in (ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE)
+            if is_key and len(c.columns) == 1:
+                key_col = table.column(c.columns[0])
+                base = _base_type(key_col.type_signature) if key_col else ""
+                keys.append((table.name, c.columns[0], base))
+    return keys
+
+
+def _base_type(type_signature: str) -> str:
+    """The type name without precision/scale, e.g. NUMBER(10,0) -> NUMBER."""
+    return type_signature.split("(")[0]
+
+
+def _name_token(column_name: str) -> str:
+    """The trailing underscore-delimited token, e.g. MANAGER_ID -> ID, EMPLOYEE_ID -> ID."""
+    return column_name.rsplit("_", 1)[-1] if "_" in column_name else column_name
+
+
 def _candidate_foreign_keys(
     schema: SchemaInfo,
     declared: list[Relationship],
@@ -94,11 +117,58 @@ def _candidate_foreign_keys(
     overlap_threshold: float,
 ) -> tuple[list[Relationship], list[Finding]]:
     parents = _single_col_keys(schema)
+    key_list = _single_col_key_list(schema)
     declared_pairs = {(r.from_table, tuple(r.from_columns)) for r in declared}
 
     candidates: list[Relationship] = []
     findings: list[Finding] = []
+    # Columns we have already paired off, so the suffix pass never double-counts them.
+    matched_cols: set[tuple[str, str]] = set()
 
+    def emit(
+        table_name: str, col_name: str, parent_table: str, parent_col: str,
+        confidence: ConfidenceLevel, evidence: list[str], orphan_rows: int, overlap: float | None,
+    ) -> None:
+        matched_cols.add((table_name, col_name))
+        candidates.append(
+            Relationship(
+                from_table=table_name,
+                from_columns=[col_name],
+                to_table=parent_table,
+                to_columns=[parent_col],
+                declared=False,
+                confidence=confidence,
+                evidence=evidence,
+            )
+        )
+        if orphan_rows > 0 and overlap is not None:
+            findings.append(
+                Finding(
+                    kind=FindingKind.ORPHAN_ROWS,
+                    severity=Severity.WARNING,
+                    table=table_name,
+                    columns=[col_name],
+                    message=(
+                        f"{orphan_rows} row(s) in {table_name}.{col_name} have no "
+                        f"matching {parent_table}.{parent_col} (undeclared FK)."
+                    ),
+                    details={"orphan_rows": orphan_rows, "overlap": round(overlap, 4)},
+                )
+            )
+        findings.append(
+            Finding(
+                kind=FindingKind.UNDECLARED_FK_CANDIDATE,
+                severity=Severity.NOTICE,
+                table=table_name,
+                columns=[col_name],
+                message=(
+                    f"Likely undeclared foreign key: {table_name}.{col_name} -> "
+                    f"{parent_table}.{parent_col} ({confidence.value} confidence)."
+                ),
+            )
+        )
+
+    # Pass 1 — exact name match: a column named exactly like a key column elsewhere.
     for table in schema.tables:
         for col in table.columns:
             parent = parents.get(col.name)
@@ -118,10 +188,12 @@ def _candidate_foreign_keys(
                 if parent_info and parent_info.column(parent_col)
                 else None
             )
-            if parent_type and parent_type.split("(")[0] != child_type.split("(")[0]:
+            if parent_type and _base_type(parent_type) != _base_type(child_type):
                 evidence.append(f"Type differs: {child_type} vs {parent_type} (compared as text).")
 
             confidence = ConfidenceLevel.LOW
+            overlap: float | None = None
+            orphan_rows = 0
             if db is not None and owner is not None:
                 overlap, orphan_rows = _value_overlap(
                     db, owner, table.name, col.name, parent_table, parent_col
@@ -129,47 +201,55 @@ def _candidate_foreign_keys(
                 if overlap is None or overlap < overlap_threshold:
                     continue  # data does not support a relationship
                 evidence.append(f"{overlap:.0%} of distinct values exist in the parent key.")
-                confidence = (
-                    ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
-                )
-                if orphan_rows > 0:
-                    findings.append(
-                        Finding(
-                            kind=FindingKind.ORPHAN_ROWS,
-                            severity=Severity.WARNING,
-                            table=table.name,
-                            columns=[col.name],
-                            message=(
-                                f"{orphan_rows} row(s) in {table.name}.{col.name} have no "
-                                f"matching {parent_table}.{parent_col} (undeclared FK)."
-                            ),
-                            details={"orphan_rows": orphan_rows, "overlap": round(overlap, 4)},
-                        )
-                    )
+                confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
 
-            candidates.append(
-                Relationship(
-                    from_table=table.name,
-                    from_columns=[col.name],
-                    to_table=parent_table,
-                    to_columns=[parent_col],
-                    declared=False,
-                    confidence=confidence,
-                    evidence=evidence,
-                )
-            )
-            findings.append(
-                Finding(
-                    kind=FindingKind.UNDECLARED_FK_CANDIDATE,
-                    severity=Severity.NOTICE,
-                    table=table.name,
-                    columns=[col.name],
-                    message=(
-                        f"Likely undeclared foreign key: {table.name}.{col.name} -> "
-                        f"{parent_table}.{parent_col} ({confidence.value} confidence)."
-                    ),
-                )
-            )
+            emit(table.name, col.name, parent_table, parent_col,
+                 confidence, evidence, orphan_rows, overlap)
+
+    # Pass 2 — suffix match, confirmed by data. Catches role/self references whose name does
+    # NOT equal the key (e.g. EMPLOYEES.MANAGER_ID -> EMPLOYEES.EMPLOYEE_ID): same trailing
+    # token ("_ID"), same base type, and a high value overlap. Data-gated to protect precision,
+    # so it only runs against a live database — never offline.
+    if db is not None and owner is not None:
+        own_keys = {(t, c) for (t, c, _) in key_list}
+        for table in schema.tables:
+            for col in table.columns:
+                if (table.name, col.name) in matched_cols:
+                    continue
+                if (table.name, (col.name,)) in declared_pairs:
+                    continue
+                if (table.name, col.name) in own_keys:
+                    continue  # this column is its own table's key, not a reference to another
+                token = _name_token(col.name)
+                child_base = _base_type(col.type_signature)
+                # Compatible keys: same suffix token + same base type, but not this exact column.
+                compatible = [
+                    (t, c) for (t, c, bt) in key_list
+                    if _name_token(c) == token and bt == child_base
+                    and not (t == table.name and c == col.name)
+                ]
+                best: tuple[float, int, str, str] | None = None
+                for parent_table, parent_col in compatible:
+                    overlap, orphan_rows = _value_overlap(
+                        db, owner, table.name, col.name, parent_table, parent_col
+                    )
+                    if overlap is None or overlap < overlap_threshold:
+                        continue
+                    if best is None or overlap > best[0]:
+                        best = (overlap, orphan_rows, parent_table, parent_col)
+                if best is None:
+                    continue
+                overlap, orphan_rows, parent_table, parent_col = best
+                self_ref = " (self-reference)" if parent_table == table.name else ""
+                evidence = [
+                    f"Name suffix '{token}' and type match {parent_table}.{parent_col}"
+                    f"{self_ref}.",
+                    f"{overlap:.0%} of distinct values exist in the parent key.",
+                ]
+                confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
+                emit(table.name, col.name, parent_table, parent_col,
+                     confidence, evidence, orphan_rows, overlap)
+
     return candidates, findings
 
 

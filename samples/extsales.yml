@@ -1,0 +1,14 @@
+# Capture ground truth for the cross-schema test schema alone (EXTSALES -> HR FKs).
+# Connect as SYSTEM so the cross-schema referenced keys (in HR) are resolvable.
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "SYSTEM"
+  password: "oracle"
+  schema: "EXTSALES"
+
+llm:
+  provider: "heuristic"
+
+output:
+  dir: "samples/out"
+  name: "extsales_map"

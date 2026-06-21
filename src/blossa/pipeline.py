@@ -18,7 +18,7 @@ from . import __version__
 from .checks import run_checks
 from .config import Settings
 from .db.connection import Database, QueryExecutor
-from .db.introspect import introspect_schema
+from .db.introspect import introspect_schemas, list_non_system_schemas
 from .db.profile import profile_table
 from .llm import get_provider
 from .llm.base import LLMProvider
@@ -40,13 +40,23 @@ def _noop(_msg: str) -> None:  # pragma: no cover - trivial
     pass
 
 
+def _owners_to_scan(db: Database, settings: Settings) -> list[str]:
+    """Which schemas to scan: explicit list, every non-system one ("*"), or the login user."""
+    cfg = settings.oracle
+    if cfg.scan_all_non_system:
+        return list_non_system_schemas(db)
+    explicit = cfg.explicit_owners()
+    return explicit or [db.effective_schema]
+
+
 def introspect_and_profile(
     db: Database, settings: Settings, status: StatusFn = _noop
 ) -> SchemaInfo:
     """Read the data dictionary and (unless disabled) attach PII-safe profiles."""
-    owner = db.effective_schema
-    status(f"Introspecting schema {owner} ...")
-    schema = introspect_schema(db, owner)
+    owners = _owners_to_scan(db, settings)
+    label = owners[0] if len(owners) == 1 else f"{len(owners)} schemas ({', '.join(owners)})"
+    status(f"Introspecting {label} ...")
+    schema = introspect_schemas(db, owners)
 
     if settings.scan.max_tables and len(schema.tables) > settings.scan.max_tables:
         schema.tables = schema.tables[: settings.scan.max_tables]
@@ -54,7 +64,7 @@ def introspect_and_profile(
     if not settings.scan.skip_profiling:
         for table in schema.tables:
             status(f"Profiling {table.name} ...")
-            profile_table(db, owner, table, settings.scan.sample_rows)
+            profile_table(db, table.owner or db.effective_schema, table, settings.scan.sample_rows)
     return schema
 
 

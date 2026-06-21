@@ -98,6 +98,7 @@ def introspect_schema(db: QueryExecutor, owner: str) -> SchemaInfo:
         schema.tables.append(
             TableInfo(
                 name=table_name,
+                owner=owner,
                 comment=table_comments.get(table_name),
                 num_rows=_as_int(trow.get("NUM_ROWS")),
                 columns=columns_by_table.get(table_name, []),
@@ -106,6 +107,39 @@ def introspect_schema(db: QueryExecutor, owner: str) -> SchemaInfo:
             )
         )
     return schema
+
+
+# Oracle-maintained schemas we never want to scan when the user asks for "all non-system".
+_SYSTEM_SCHEMAS = (
+    "SYS", "SYSTEM", "XDB", "MDSYS", "CTXSYS", "DBSNMP", "OUTLN", "GSMADMIN_INTERNAL",
+    "LBACSYS", "DVSYS", "DVF", "AUDSYS", "APPQOSSYS", "OJVMSYS", "ORDSYS", "ORDDATA",
+    "ORDPLUGINS", "SI_INFORMTN_SCHEMA", "WMSYS", "OLAPSYS", "REMOTE_SCHEDULER_AGENT",
+    "ANONYMOUS", "GGSYS", "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "PDBADMIN",
+    "FLOWS_FILES", "APEX_PUBLIC_USER", "DIP", "ORACLE_OCM", "XS$NULL",
+)
+
+
+def list_non_system_schemas(db: QueryExecutor) -> list[str]:
+    """Every schema that actually owns a table and isn't an Oracle-maintained one."""
+    placeholders = ", ".join(f"'{s}'" for s in _SYSTEM_SCHEMAS)
+    sql = f"""
+        SELECT DISTINCT OWNER FROM ALL_TABLES
+         WHERE OWNER NOT IN ({placeholders})
+           AND OWNER NOT LIKE 'APEX_%'
+           AND OWNER NOT LIKE 'FLOWS_%'
+         ORDER BY OWNER
+    """  # noqa: S608 - the IN list is a fixed constant, not user input
+    return [r["OWNER"] for r in db.query(sql)]
+
+
+def introspect_schemas(db: QueryExecutor, owners: list[str]) -> SchemaInfo:
+    """Introspect several owners and merge them into one SchemaInfo (tables tagged with owner)."""
+    if len(owners) == 1:
+        return introspect_schema(db, owners[0])
+    merged = SchemaInfo(name="+".join(owners))
+    for owner in owners:
+        merged.tables.extend(introspect_schema(db, owner).tables)
+    return merged
 
 
 def _group_columns(
@@ -143,6 +177,18 @@ def _build_constraints(db: QueryExecutor, binds: dict[str, Any]) -> dict[str, li
     # Index by constraint name so we can resolve FK -> referenced (table, columns).
     by_name = {r["CONSTRAINT_NAME"]: r for r in cons_rows}
 
+    # A FK may reference a key in ANOTHER schema; those referenced constraints aren't in this
+    # owner's rows, so resolve them with a targeted lookup keyed by (R_OWNER, R_CONSTRAINT_NAME).
+    cross = {
+        (r.get("R_OWNER"), r.get("R_CONSTRAINT_NAME"))
+        for r in cons_rows
+        if ConstraintType(r["CONSTRAINT_TYPE"]) == ConstraintType.FOREIGN_KEY
+        and r.get("R_CONSTRAINT_NAME") not in by_name
+        and r.get("R_OWNER")
+        and r.get("R_CONSTRAINT_NAME")
+    }
+    cross_ref = _resolve_referenced(db, cross)
+
     out: dict[str, list[ConstraintInfo]] = {}
     for r in cons_rows:
         cname = r["CONSTRAINT_NAME"]
@@ -151,9 +197,13 @@ def _build_constraints(db: QueryExecutor, binds: dict[str, Any]) -> dict[str, li
         referenced_columns: list[str] = []
         if ctype == ConstraintType.FOREIGN_KEY:
             ref = by_name.get(r.get("R_CONSTRAINT_NAME"))
-            if ref is not None:
+            if ref is not None:  # same-schema reference
                 referenced_table = ref["TABLE_NAME"]
                 referenced_columns = cols_by_cons.get(ref["CONSTRAINT_NAME"], [])
+            else:  # cross-schema reference, resolved separately
+                resolved = cross_ref.get((r.get("R_OWNER"), r.get("R_CONSTRAINT_NAME")))
+                if resolved is not None:
+                    referenced_table, referenced_columns = resolved
 
         out.setdefault(r["TABLE_NAME"], []).append(
             ConstraintInfo(
@@ -166,6 +216,35 @@ def _build_constraints(db: QueryExecutor, binds: dict[str, Any]) -> dict[str, li
                 status=r.get("STATUS"),
             )
         )
+    return out
+
+
+def _resolve_referenced(
+    db: QueryExecutor, refs: set[tuple[str, str]]
+) -> dict[tuple[str, str], tuple[str, list[str]]]:
+    """Resolve (owner, constraint) -> (table, columns) for keys referenced from another schema."""
+    out: dict[tuple[str, str], tuple[str, list[str]]] = {}
+    by_owner: dict[str, set[str]] = {}
+    for r_owner, r_cons in refs:
+        by_owner.setdefault(r_owner, set()).add(r_cons)
+    for r_owner, names in by_owner.items():
+        in_list = ", ".join(f"'{n}'" for n in sorted(names))
+        # Identifiers come from the data dictionary (R_OWNER / R_CONSTRAINT_NAME), not user input.
+        crows = db.query(  # noqa: S608
+            f"SELECT CONSTRAINT_NAME, TABLE_NAME FROM ALL_CONSTRAINTS "
+            f"WHERE OWNER = '{r_owner}' AND CONSTRAINT_NAME IN ({in_list})"
+        )
+        ccols = db.query(  # noqa: S608
+            f"SELECT CONSTRAINT_NAME, COLUMN_NAME, POSITION FROM ALL_CONS_COLUMNS "
+            f"WHERE OWNER = '{r_owner}' AND CONSTRAINT_NAME IN ({in_list}) "
+            f"ORDER BY CONSTRAINT_NAME, POSITION"
+        )
+        cols_by: dict[str, list[str]] = {}
+        for r in ccols:
+            cols_by.setdefault(r["CONSTRAINT_NAME"], []).append(r["COLUMN_NAME"])
+        for r in crows:
+            cname = r["CONSTRAINT_NAME"]
+            out[(r_owner, cname)] = (r["TABLE_NAME"], cols_by.get(cname, []))
     return out
 
 

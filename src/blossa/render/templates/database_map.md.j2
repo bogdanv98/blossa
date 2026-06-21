@@ -25,7 +25,7 @@ relying on them. No raw row values were sent to the language model — only PII-
 **Declared foreign keys ({{ declared | length }}):**
 {% if declared %}
 {% for r in declared %}
-- `{{ r.from_table }}({{ r.from_columns | join(", ") }})` → `{{ r.to_table }}({{ r.to_columns | join(", ") }})`
+- `{{ (r.from_owner ~ "." if r.cross_schema else "") }}{{ r.from_table }}({{ r.from_columns | join(", ") }})` → `{{ (r.to_owner ~ "." if r.cross_schema else "") }}{{ r.to_table }}({{ r.to_columns | join(", ") }})`{{ "  _(cross-schema)_" if r.cross_schema else "" }}
 {% endfor %}
 {% else %}
 - _None declared._
@@ -34,7 +34,7 @@ relying on them. No raw row values were sent to the language model — only PII-
 **Inferred / undeclared foreign keys ({{ inferred | length }}):**
 {% if inferred %}
 {% for r in inferred %}
-- `{{ r.from_table }}({{ r.from_columns | join(", ") }})` → `{{ r.to_table }}({{ r.to_columns | join(", ") }})` — {{ r.confidence | confidence }}
+- `{{ (r.from_owner ~ "." if r.cross_schema else "") }}{{ r.from_table }}({{ r.from_columns | join(", ") }})` → `{{ (r.to_owner ~ "." if r.cross_schema else "") }}{{ r.to_table }}({{ r.to_columns | join(", ") }})` — {{ r.confidence | confidence }}
   {% for e in r.evidence %}
   - {{ e }}
   {% endfor %}

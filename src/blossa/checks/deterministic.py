@@ -23,6 +23,7 @@ from ..models import (
     Relationship,
     SchemaInfo,
     Severity,
+    TableInfo,
 )
 
 # Suffix pairs that usually mean the same thing — using both is a naming inconsistency.
@@ -70,43 +71,49 @@ def _declared_relationships(schema: SchemaInfo) -> list[Relationship]:
                     declared=True,
                     confidence=ConfidenceLevel.HIGH,
                     evidence=[f"Declared foreign key constraint {fk.name}."],
+                    from_owner=table.owner,
+                    to_owner=table.owner,
                 )
             )
     return rels
 
 
-def _single_col_keys(schema: SchemaInfo) -> dict[str, tuple[str, str]]:
-    """Map PK/unique single-column key column-name -> (table, column) for parent matching."""
-    keys: dict[str, tuple[str, str]] = {}
+# A single-column key parent: (owner, table, column, base_type).
+SingleKey = tuple[str, str, str, str]
+# A composite key parent: (owner, table, (column, ...)).
+CompositeKey = tuple[str, str, tuple[str, ...]]
+
+
+def _table_owner(table: TableInfo, fallback: str | None) -> str:
+    """A table's owner, falling back to the scan's primary owner for un-tagged fixtures."""
+    return table.owner or (fallback or "")
+
+
+def _single_col_keys(schema: SchemaInfo, fallback: str | None) -> dict[str, list[SingleKey]]:
+    """Map key column-name -> every single-column PK/unique key with that name (across owners)."""
+    keys: dict[str, list[SingleKey]] = {}
     for table in schema.tables:
+        owner = _table_owner(table, fallback)
         for c in table.constraints:
             is_key = c.type in (ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE)
             if is_key and len(c.columns) == 1:
-                keys.setdefault(c.columns[0], (table.name, c.columns[0]))
+                kc = table.column(c.columns[0])
+                base = _base_type(kc.type_signature) if kc else ""
+                keys.setdefault(c.columns[0], []).append(
+                    (owner, table.name, c.columns[0], base)
+                )
     return keys
 
 
-def _single_col_key_list(schema: SchemaInfo) -> list[tuple[str, str, str]]:
-    """Every single-column PK/unique key as (table, column, base_type), for suffix matching."""
-    keys: list[tuple[str, str, str]] = []
+def _composite_keys(schema: SchemaInfo, fallback: str | None) -> list[CompositeKey]:
+    """Every multi-column PK/unique key as (owner, table, (col, ...)), for composite-FK matching."""
+    keys: list[CompositeKey] = []
     for table in schema.tables:
-        for c in table.constraints:
-            is_key = c.type in (ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE)
-            if is_key and len(c.columns) == 1:
-                key_col = table.column(c.columns[0])
-                base = _base_type(key_col.type_signature) if key_col else ""
-                keys.append((table.name, c.columns[0], base))
-    return keys
-
-
-def _composite_keys(schema: SchemaInfo) -> list[tuple[str, tuple[str, ...]]]:
-    """Every multi-column PK/unique key as (table, (col, ...)), for composite-FK matching."""
-    keys: list[tuple[str, tuple[str, ...]]] = []
-    for table in schema.tables:
+        owner = _table_owner(table, fallback)
         for c in table.constraints:
             is_key = c.type in (ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE)
             if is_key and len(c.columns) >= 2:
-                keys.append((table.name, tuple(c.columns)))
+                keys.append((owner, table.name, tuple(c.columns)))
     return keys
 
 
@@ -127,23 +134,30 @@ def _candidate_foreign_keys(
     owner: str | None,
     overlap_threshold: float,
 ) -> tuple[list[Relationship], list[Finding]]:
-    parents = _single_col_keys(schema)
-    key_list = _single_col_key_list(schema)
-    declared_pairs = {(r.from_table, tuple(r.from_columns)) for r in declared}
+    fb = owner  # fallback owner for fixtures whose tables aren't owner-tagged
+    parents = _single_col_keys(schema, fb)          # col name -> [(owner, table, col, base), ...]
+    key_list = [k for ks in parents.values() for k in ks]
+    composite_parents = _composite_keys(schema, fb)
+    declared_pairs = {
+        (r.from_owner or fb or "", r.from_table, tuple(r.from_columns)) for r in declared
+    }
 
     candidates: list[Relationship] = []
     findings: list[Finding] = []
-    # Columns we have already paired off, so the suffix pass never double-counts them.
-    matched_cols: set[tuple[str, str]] = set()
+    # (owner, table, column) tuples already paired off, so later passes never double-count them.
+    matched_cols: set[tuple[str, str, str]] = set()
 
     def emit(
-        table_name: str, from_cols: list[str], parent_table: str, parent_cols: list[str],
+        child_owner: str, table_name: str, from_cols: list[str],
+        parent_owner: str, parent_table: str, parent_cols: list[str],
         confidence: ConfidenceLevel, evidence: list[str], orphan_rows: int, overlap: float | None,
     ) -> None:
         for c in from_cols:
-            matched_cols.add((table_name, c))
+            matched_cols.add((child_owner, table_name, c))
+        cross = bool(child_owner and parent_owner and child_owner != parent_owner)
         child_ref = f"{table_name}({', '.join(from_cols)})"
-        parent_ref = f"{parent_table}({', '.join(parent_cols)})"
+        pq = f"{parent_owner}.{parent_table}" if cross else parent_table
+        parent_ref = f"{pq}({', '.join(parent_cols)})"
         candidates.append(
             Relationship(
                 from_table=table_name,
@@ -153,6 +167,8 @@ def _candidate_foreign_keys(
                 declared=False,
                 confidence=confidence,
                 evidence=evidence,
+                from_owner=child_owner or None,
+                to_owner=parent_owner or None,
             )
         )
         if orphan_rows > 0 and overlap is not None:
@@ -182,120 +198,130 @@ def _candidate_foreign_keys(
             )
         )
 
-    # Pass 1 — exact name match: a column named exactly like a key column elsewhere.
+    def name_note(parent_owner: str, parent_table: str, parent_col: str, child_owner: str) -> str:
+        cross = " (cross-schema)" if parent_owner and parent_owner != child_owner else ""
+        return f"Column name matches {parent_table}.{parent_col} (a key column){cross}."
+
+    # Pass 1 — exact name match: a column named exactly like a key column elsewhere. When more
+    # than one schema owns such a key, the data overlap decides which one (and, with no DB to
+    # decide, an ambiguous match is left alone).
     for table in schema.tables:
+        co = _table_owner(table, fb)
         for col in table.columns:
-            parent = parents.get(col.name)
-            if parent is None:
+            cands = [
+                k for k in parents.get(col.name, [])
+                if not (k[0] == co and k[1] == table.name)  # drop the column's own key
+            ]
+            if not cands:
                 continue
-            parent_table, parent_col = parent
-            if parent_table == table.name:
-                continue  # this column IS the key, not a reference to another table
-            if (table.name, (col.name,)) in declared_pairs:
-                continue  # already a declared FK
+            if (co, table.name, (col.name,)) in declared_pairs:
+                continue
+            child_base = _base_type(col.type_signature)
 
-            evidence = [f"Column name matches {parent_table}.{parent_col} (a key column)."]
-            parent_info = schema.table(parent_table)
-            child_type = col.type_signature
-            parent_type = (
-                parent_info.column(parent_col).type_signature
-                if parent_info and parent_info.column(parent_col)
-                else None
-            )
-            if parent_type and _base_type(parent_type) != _base_type(child_type):
-                evidence.append(f"Type differs: {child_type} vs {parent_type} (compared as text).")
+            if db is not None:
+                best: tuple[float, int, str, str, str] | None = None
+                for po, pt, pc, _pb in cands:
+                    ov, orph = _value_overlap(db, co, table.name, col.name, po, pt, pc)
+                    if ov is None or ov < overlap_threshold:
+                        continue
+                    if best is None or ov > best[0]:
+                        best = (ov, orph, po, pt, pc)
+                if best is None:
+                    continue
+                ov, orph, po, pt, pc = best
+                pb = next((b for (o, t, c, b) in cands if o == po and t == pt and c == pc), "")
+                evidence = [name_note(po, pt, pc, co)]
+                if pb and pb != child_base:
+                    evidence.append(f"Type differs from parent: {col.type_signature} vs {pb}.")
+                evidence.append(f"{ov:.0%} of distinct values exist in the parent key.")
+                conf = ConfidenceLevel.HIGH if ov >= 0.99 else ConfidenceLevel.MEDIUM
+                emit(co, table.name, [col.name], po, pt, [pc], conf, evidence, orph, ov)
+            else:
+                if len(cands) != 1:
+                    continue  # ambiguous without data to disambiguate
+                po, pt, pc, pb = cands[0]
+                evidence = [name_note(po, pt, pc, co)]
+                if pb and pb != child_base:
+                    evidence.append(f"Type differs from parent: {col.type_signature} vs {pb}.")
+                emit(co, table.name, [col.name], po, pt, [pc],
+                     ConfidenceLevel.LOW, evidence, 0, None)
 
-            confidence = ConfidenceLevel.LOW
-            overlap: float | None = None
-            orphan_rows = 0
-            if db is not None and owner is not None:
-                overlap, orphan_rows = _value_overlap(
-                    db, owner, table.name, col.name, parent_table, parent_col
-                )
-                if overlap is None or overlap < overlap_threshold:
-                    continue  # data does not support a relationship
-                evidence.append(f"{overlap:.0%} of distinct values exist in the parent key.")
-                confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
-
-            emit(table.name, [col.name], parent_table, [parent_col],
-                 confidence, evidence, orphan_rows, overlap)
-
-    # Pass 2 — suffix match, confirmed by data. Catches role/self references whose name does
-    # NOT equal the key (e.g. EMPLOYEES.MANAGER_ID -> EMPLOYEES.EMPLOYEE_ID): same trailing
-    # token ("_ID"), same base type, and a high value overlap. Data-gated to protect precision,
-    # so it only runs against a live database — never offline.
-    if db is not None and owner is not None:
-        own_keys = {(t, c) for (t, c, _) in key_list}
+    # Pass 2 — suffix match, confirmed by data. Catches role/self refs whose name does NOT
+    # equal the key (MANAGER_ID -> EMPLOYEE_ID, or a cross-schema SALES_REP_ID -> HR.EMPLOYEES):
+    # same trailing token ("_ID"), same base type, and a high value overlap. Data-gated to protect
+    # precision, so it only runs against a live database — never offline.
+    if db is not None:
+        own_keys = {(po, pt, pc) for (po, pt, pc, _pb) in key_list}
         for table in schema.tables:
+            co = _table_owner(table, fb)
             for col in table.columns:
-                if (table.name, col.name) in matched_cols:
+                if (co, table.name, col.name) in matched_cols:
                     continue
-                if (table.name, (col.name,)) in declared_pairs:
+                if (co, table.name, (col.name,)) in declared_pairs:
                     continue
-                if (table.name, col.name) in own_keys:
+                if (co, table.name, col.name) in own_keys:
                     continue  # this column is its own table's key, not a reference to another
                 token = _name_token(col.name)
                 child_base = _base_type(col.type_signature)
-                # Compatible keys: same suffix token + same base type, but not this exact column.
                 compatible = [
-                    (t, c) for (t, c, bt) in key_list
-                    if _name_token(c) == token and bt == child_base
-                    and not (t == table.name and c == col.name)
+                    (po, pt, pc) for (po, pt, pc, pb) in key_list
+                    if _name_token(pc) == token and pb == child_base
+                    and not (po == co and pt == table.name and pc == col.name)
                 ]
-                best: tuple[float, int, str, str] | None = None
-                for parent_table, parent_col in compatible:
-                    overlap, orphan_rows = _value_overlap(
-                        db, owner, table.name, col.name, parent_table, parent_col
-                    )
-                    if overlap is None or overlap < overlap_threshold:
+                best2: tuple[float, int, str, str, str] | None = None
+                for po, pt, pc in compatible:
+                    ov, orph = _value_overlap(db, co, table.name, col.name, po, pt, pc)
+                    if ov is None or ov < overlap_threshold:
                         continue
-                    if best is None or overlap > best[0]:
-                        best = (overlap, orphan_rows, parent_table, parent_col)
-                if best is None:
+                    if best2 is None or ov > best2[0]:
+                        best2 = (ov, orph, po, pt, pc)
+                if best2 is None:
                     continue
-                overlap, orphan_rows, parent_table, parent_col = best
-                self_ref = " (self-reference)" if parent_table == table.name else ""
+                ov, orph, po, pt, pc = best2
+                tags = ""
+                if po == co and pt == table.name:
+                    tags = " (self-reference)"
+                elif po != co:
+                    tags = " (cross-schema)"
                 evidence = [
-                    f"Name suffix '{token}' and type match {parent_table}.{parent_col}"
-                    f"{self_ref}.",
-                    f"{overlap:.0%} of distinct values exist in the parent key.",
+                    f"Name suffix '{token}' and type match {pt}.{pc}{tags}.",
+                    f"{ov:.0%} of distinct values exist in the parent key.",
                 ]
-                confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
-                emit(table.name, [col.name], parent_table, [parent_col],
-                     confidence, evidence, orphan_rows, overlap)
+                conf = ConfidenceLevel.HIGH if ov >= 0.99 else ConfidenceLevel.MEDIUM
+                emit(co, table.name, [col.name], po, pt, [pc], conf, evidence, orph, ov)
 
     # Pass 3 — composite keys: a table that carries every column of another table's multi-column
     # key (matched by name) likely references it. Confirmed by tuple overlap when a DB is present;
     # offline it is reported LOW, mirroring the single-column exact-name pass.
-    composite_parents = _composite_keys(schema)
     for table in schema.tables:
+        co = _table_owner(table, fb)
         col_names = {c.name for c in table.columns}
-        for parent_table, key_cols in composite_parents:
-            if parent_table == table.name:
+        for po, pt, key_cols in composite_parents:
+            if po == co and pt == table.name:
                 continue
             if not set(key_cols).issubset(col_names):
                 continue  # child lacks one or more of the key's columns
             from_cols = list(key_cols)  # keep the parent key's column order
-            if (table.name, tuple(from_cols)) in declared_pairs:
+            if (co, table.name, tuple(from_cols)) in declared_pairs:
                 continue
 
+            cross = " (cross-schema)" if po != co else ""
             evidence = [
-                f"Carries all columns of {parent_table}'s composite key "
-                f"({', '.join(key_cols)})."
+                f"Carries all columns of {pt}'s composite key ({', '.join(key_cols)}){cross}."
             ]
             confidence = ConfidenceLevel.LOW
-            overlap = None
+            overlap: float | None = None
             orphan_rows = 0
-            if db is not None and owner is not None:
+            if db is not None:
                 overlap, orphan_rows = _composite_value_overlap(
-                    db, owner, table.name, from_cols, parent_table, list(key_cols)
+                    db, co, table.name, from_cols, po, pt, list(key_cols)
                 )
                 if overlap is None or overlap < overlap_threshold:
                     continue  # data does not support the relationship
                 evidence.append(f"{overlap:.0%} of distinct value tuples exist in the parent key.")
                 confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
 
-            emit(table.name, from_cols, parent_table, list(key_cols),
+            emit(co, table.name, from_cols, po, pt, list(key_cols),
                  confidence, evidence, orphan_rows, overlap)
 
     return candidates, findings
@@ -303,18 +329,20 @@ def _candidate_foreign_keys(
 
 def _value_overlap(
     db: QueryExecutor,
-    owner: str,
+    child_owner: str,
     child_table: str,
     child_col: str,
+    parent_owner: str,
     parent_table: str,
     parent_col: str,
 ) -> tuple[float | None, int]:
     """Fraction of distinct child values present in the parent key, and orphan row count.
 
+    Child and parent may live in different schemas (cross-schema FK), hence separate owners.
     Values are compared as text (TO_CHAR) so a VARCHAR child can still match a NUMBER parent.
     """
-    child = f'"{owner}"."{child_table}"'
-    parent = f'"{owner}"."{parent_table}"'
+    child = f'"{child_owner}"."{child_table}"'
+    parent = f'"{parent_owner}"."{parent_table}"'
     cc, pc = f'"{child_col}"', f'"{parent_col}"'
     sql = f"""
         SELECT
@@ -347,16 +375,17 @@ def _value_overlap(
 
 def _composite_value_overlap(
     db: QueryExecutor,
-    owner: str,
+    child_owner: str,
     child_table: str,
     child_cols: list[str],
+    parent_owner: str,
     parent_table: str,
     parent_cols: list[str],
 ) -> tuple[float | None, int]:
     """Like `_value_overlap`, but for a multi-column key: the fraction of distinct child value
     *tuples* present in the parent key, plus the orphan row count. Columns compared as text."""
-    child = f'"{owner}"."{child_table}"'
-    parent = f'"{owner}"."{parent_table}"'
+    child = f'"{child_owner}"."{child_table}"'
+    parent = f'"{parent_owner}"."{parent_table}"'
     cc = [f'"{c}"' for c in child_cols]
     pc = [f'"{c}"' for c in parent_cols]
     not_null = " AND ".join(f"{c} IS NOT NULL" for c in cc)

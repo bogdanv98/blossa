@@ -22,6 +22,19 @@ how many did Blossa produce a confident meaning.
 - **SH** (Sales History) — advanced/optional; it loads data via external files and is fiddly in a
   container. Skip unless you specifically want a large star schema for scale testing.
 
+## Quick start (one command)
+
+If you just want the whole thing to run end-to-end, use the orchestrator. It brings up the
+container, stages + installs HR non-interactively, captures truth, legacy-ifies, scans, and evals:
+
+```bash
+bash samples/run_eval.sh            # heuristic baseline (offline)
+bash samples/run_eval.sh ollama     # semantic pass (needs Ollama running + the model pulled)
+```
+
+Prereq: Docker Desktop running, and `blossa` installed (`pip install -e .`). The steps below are
+the same flow done manually, for when you want to run a single stage at a time.
+
 ## Steps
 
 ### 0. Bring up the demo Oracle container

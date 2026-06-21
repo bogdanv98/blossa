@@ -85,6 +85,24 @@ foreign keys Blossa failed to rediscover — exactly the cases worth improving n
 > Tip: run step 5 once with `--llm-provider heuristic` and once with `ollama` to see how much the
 > language model adds over the deterministic baseline.
 
+## Composite-FK test schema (synthetic)
+
+None of Oracle's sample schemas declare a **composite** (multi-column) foreign key, so there is
+nothing to measure composite-FK rediscovery against. [composite_demo.sql](composite_demo.sql)
+creates a tiny synthetic schema (`CFKDEMO`) whose only purpose is to contain one real composite FK:
+`ITEM_RETURNS(order_id, item_no) -> ORDER_ITEMS(order_id, item_no)`. Run it through the same flow:
+
+```bash
+docker cp samples/composite_demo.sql blossa-oracle:/tmp/composite_demo.sql
+docker exec -i blossa-oracle sqlplus -s system/oracle@//localhost:1521/XEPDB1 @/tmp/composite_demo.sql
+blossa ground-truth -c samples/cfk.yml -o samples/cfk_truth.json
+docker exec -i blossa-oracle sqlplus -s CFKDEMO/oracle@//localhost:1521/XEPDB1 @/tmp/legacy_ify.sql
+blossa scan -c samples/cfk.yml --llm-provider heuristic
+blossa eval -t samples/cfk_truth.json -s samples/out/cfk_map.json
+```
+
+(On Windows/Git Bash, prefix the `docker exec ... @/tmp/...` lines with `MSYS_NO_PATHCONV=1`.)
+
 ## Note
 
 These are throwaway sample databases meant for testing. `legacy_ify.sql` is **destructive** — only

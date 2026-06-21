@@ -99,6 +99,17 @@ def _single_col_key_list(schema: SchemaInfo) -> list[tuple[str, str, str]]:
     return keys
 
 
+def _composite_keys(schema: SchemaInfo) -> list[tuple[str, tuple[str, ...]]]:
+    """Every multi-column PK/unique key as (table, (col, ...)), for composite-FK matching."""
+    keys: list[tuple[str, tuple[str, ...]]] = []
+    for table in schema.tables:
+        for c in table.constraints:
+            is_key = c.type in (ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE)
+            if is_key and len(c.columns) >= 2:
+                keys.append((table.name, tuple(c.columns)))
+    return keys
+
+
 def _base_type(type_signature: str) -> str:
     """The type name without precision/scale, e.g. NUMBER(10,0) -> NUMBER."""
     return type_signature.split("(")[0]
@@ -126,16 +137,19 @@ def _candidate_foreign_keys(
     matched_cols: set[tuple[str, str]] = set()
 
     def emit(
-        table_name: str, col_name: str, parent_table: str, parent_col: str,
+        table_name: str, from_cols: list[str], parent_table: str, parent_cols: list[str],
         confidence: ConfidenceLevel, evidence: list[str], orphan_rows: int, overlap: float | None,
     ) -> None:
-        matched_cols.add((table_name, col_name))
+        for c in from_cols:
+            matched_cols.add((table_name, c))
+        child_ref = f"{table_name}({', '.join(from_cols)})"
+        parent_ref = f"{parent_table}({', '.join(parent_cols)})"
         candidates.append(
             Relationship(
                 from_table=table_name,
-                from_columns=[col_name],
+                from_columns=from_cols,
                 to_table=parent_table,
-                to_columns=[parent_col],
+                to_columns=parent_cols,
                 declared=False,
                 confidence=confidence,
                 evidence=evidence,
@@ -147,10 +161,10 @@ def _candidate_foreign_keys(
                     kind=FindingKind.ORPHAN_ROWS,
                     severity=Severity.WARNING,
                     table=table_name,
-                    columns=[col_name],
+                    columns=from_cols,
                     message=(
-                        f"{orphan_rows} row(s) in {table_name}.{col_name} have no "
-                        f"matching {parent_table}.{parent_col} (undeclared FK)."
+                        f"{orphan_rows} row(s) in {child_ref} have no "
+                        f"matching {parent_ref} (undeclared FK)."
                     ),
                     details={"orphan_rows": orphan_rows, "overlap": round(overlap, 4)},
                 )
@@ -160,10 +174,10 @@ def _candidate_foreign_keys(
                 kind=FindingKind.UNDECLARED_FK_CANDIDATE,
                 severity=Severity.NOTICE,
                 table=table_name,
-                columns=[col_name],
+                columns=from_cols,
                 message=(
-                    f"Likely undeclared foreign key: {table_name}.{col_name} -> "
-                    f"{parent_table}.{parent_col} ({confidence.value} confidence)."
+                    f"Likely undeclared foreign key: {child_ref} -> "
+                    f"{parent_ref} ({confidence.value} confidence)."
                 ),
             )
         )
@@ -203,7 +217,7 @@ def _candidate_foreign_keys(
                 evidence.append(f"{overlap:.0%} of distinct values exist in the parent key.")
                 confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
 
-            emit(table.name, col.name, parent_table, parent_col,
+            emit(table.name, [col.name], parent_table, [parent_col],
                  confidence, evidence, orphan_rows, overlap)
 
     # Pass 2 — suffix match, confirmed by data. Catches role/self references whose name does
@@ -247,8 +261,42 @@ def _candidate_foreign_keys(
                     f"{overlap:.0%} of distinct values exist in the parent key.",
                 ]
                 confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
-                emit(table.name, col.name, parent_table, parent_col,
+                emit(table.name, [col.name], parent_table, [parent_col],
                      confidence, evidence, orphan_rows, overlap)
+
+    # Pass 3 — composite keys: a table that carries every column of another table's multi-column
+    # key (matched by name) likely references it. Confirmed by tuple overlap when a DB is present;
+    # offline it is reported LOW, mirroring the single-column exact-name pass.
+    composite_parents = _composite_keys(schema)
+    for table in schema.tables:
+        col_names = {c.name for c in table.columns}
+        for parent_table, key_cols in composite_parents:
+            if parent_table == table.name:
+                continue
+            if not set(key_cols).issubset(col_names):
+                continue  # child lacks one or more of the key's columns
+            from_cols = list(key_cols)  # keep the parent key's column order
+            if (table.name, tuple(from_cols)) in declared_pairs:
+                continue
+
+            evidence = [
+                f"Carries all columns of {parent_table}'s composite key "
+                f"({', '.join(key_cols)})."
+            ]
+            confidence = ConfidenceLevel.LOW
+            overlap = None
+            orphan_rows = 0
+            if db is not None and owner is not None:
+                overlap, orphan_rows = _composite_value_overlap(
+                    db, owner, table.name, from_cols, parent_table, list(key_cols)
+                )
+                if overlap is None or overlap < overlap_threshold:
+                    continue  # data does not support the relationship
+                evidence.append(f"{overlap:.0%} of distinct value tuples exist in the parent key.")
+                confidence = ConfidenceLevel.HIGH if overlap >= 0.99 else ConfidenceLevel.MEDIUM
+
+            emit(table.name, from_cols, parent_table, list(key_cols),
+                 confidence, evidence, orphan_rows, overlap)
 
     return candidates, findings
 
@@ -288,6 +336,50 @@ def _value_overlap(
     try:
         row = db.query(sql)[0]
     except Exception:  # noqa: BLE001 - profiling/overlap is best-effort, never fatal
+        return None, 0
+    total = int(row.get("DISTINCT_TOTAL", 0) or 0)
+    matched = int(row.get("MATCHED", 0) or 0)
+    orphan_rows = int(row.get("ORPHAN_ROWS", 0) or 0)
+    if total == 0:
+        return None, 0
+    return matched / total, orphan_rows
+
+
+def _composite_value_overlap(
+    db: QueryExecutor,
+    owner: str,
+    child_table: str,
+    child_cols: list[str],
+    parent_table: str,
+    parent_cols: list[str],
+) -> tuple[float | None, int]:
+    """Like `_value_overlap`, but for a multi-column key: the fraction of distinct child value
+    *tuples* present in the parent key, plus the orphan row count. Columns compared as text."""
+    child = f'"{owner}"."{child_table}"'
+    parent = f'"{owner}"."{parent_table}"'
+    cc = [f'"{c}"' for c in child_cols]
+    pc = [f'"{c}"' for c in parent_cols]
+    not_null = " AND ".join(f"{c} IS NOT NULL" for c in cc)
+    select_cols = ", ".join(f"TO_CHAR({c}) AS C{i}" for i, c in enumerate(cc))
+    join_d = " AND ".join(f"TO_CHAR(p.{pc[i]}) = d.C{i}" for i in range(len(pc)))
+    join_c = " AND ".join(f"TO_CHAR(p.{pc[i]}) = TO_CHAR(c.{cc[i]})" for i in range(len(pc)))
+    sql = f"""
+        SELECT
+            (SELECT COUNT(*) FROM (
+                 SELECT DISTINCT {select_cols} FROM {child} WHERE {not_null}
+             )) AS DISTINCT_TOTAL,
+            (SELECT COUNT(*) FROM (
+                 SELECT DISTINCT {select_cols} FROM {child} WHERE {not_null}
+             ) d
+             WHERE EXISTS (SELECT 1 FROM {parent} p WHERE {join_d})) AS MATCHED,
+            (SELECT COUNT(*) FROM {child} c
+              WHERE {not_null}
+                AND NOT EXISTS (SELECT 1 FROM {parent} p WHERE {join_c})) AS ORPHAN_ROWS
+        FROM dual
+    """  # noqa: S608 - all identifiers come from the Oracle data dictionary, not user input
+    try:
+        row = db.query(sql)[0]
+    except Exception:  # noqa: BLE001 - overlap is best-effort, never fatal
         return None, 0
     total = int(row.get("DISTINCT_TOTAL", 0) or 0)
     matched = int(row.get("MATCHED", 0) or 0)

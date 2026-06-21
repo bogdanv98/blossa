@@ -141,3 +141,67 @@ def test_suffix_fk_not_inferred_offline():
     inferred = {(r.from_table, tuple(r.from_columns)) for r in relationships if not r.declared}
     assert ("EMPLOYEES", ("MANAGER_ID",)) not in inferred
     assert ("EMPLOYEES", ("DEPARTMENT_ID",)) in inferred  # exact-name match still works offline
+
+
+# --------------------------------------------------------- composite (multi-column) FK inference
+
+
+def _composite_schema() -> SchemaInfo:
+    """ORDER_ITEMS has a composite PK (ORDER_ID, ITEM_NO); ITEM_RETURNS carries both columns and
+    so references it with a composite FK — the kind no Oracle sample schema actually declares."""
+    order_items = TableInfo(
+        name="ORDER_ITEMS",
+        columns=[
+            _num("ORDER_ID", 8),
+            _num("ITEM_NO", 4),
+            ColumnInfo(name="PRODUCT", data_type="VARCHAR2", data_length=40),
+        ],
+        constraints=[
+            ConstraintInfo(
+                name="PK_OI", type=ConstraintType.PRIMARY_KEY, columns=["ORDER_ID", "ITEM_NO"]
+            )
+        ],
+    )
+    item_returns = TableInfo(
+        name="ITEM_RETURNS",
+        columns=[_num("RETURN_ID", 10), _num("ORDER_ID", 8), _num("ITEM_NO", 4), _num("QTY", 4)],
+        constraints=[
+            ConstraintInfo(
+                name="PK_IR", type=ConstraintType.PRIMARY_KEY, columns=["RETURN_ID"]
+            )
+        ],
+    )
+    return SchemaInfo(name="CFK", tables=[order_items, item_returns])
+
+
+class _CompositeFakeDB:
+    """Full overlap for the composite tuple-overlap query (it aliases columns C0, C1, ...),
+    no overlap for any single-column query — isolating the composite pass under test."""
+
+    def query(self, sql: str, binds=None):
+        if "AS C1" in sql:  # the multi-column tuple-overlap query
+            return [{"DISTINCT_TOTAL": 3, "MATCHED": 3, "ORPHAN_ROWS": 0}]
+        return [{"DISTINCT_TOTAL": 0, "MATCHED": 0, "ORPHAN_ROWS": 0}]
+
+
+def test_composite_fk_inferred_from_shared_key_columns():
+    schema = _composite_schema()
+    relationships, _ = run_checks(schema, db=_CompositeFakeDB(), owner="CFK")
+    inferred = {
+        (r.from_table, tuple(r.from_columns), r.to_table) for r in relationships if not r.declared
+    }
+    assert ("ITEM_RETURNS", ("ORDER_ID", "ITEM_NO"), "ORDER_ITEMS") in inferred
+    rel = next(r for r in relationships if r.from_table == "ITEM_RETURNS" and not r.declared)
+    assert rel.to_columns == ["ORDER_ID", "ITEM_NO"]
+    assert rel.confidence == ConfidenceLevel.HIGH
+
+
+def test_composite_fk_offline_is_low_confidence():
+    """Offline (no DB) the composite name match is reported, but only LOW confidence — mirroring
+    the single-column exact-name pass; data is what promotes it to MEDIUM/HIGH."""
+    schema = _composite_schema()
+    relationships, _ = run_checks(schema)  # no db
+    comp = [
+        r for r in relationships if not r.declared and r.from_columns == ["ORDER_ID", "ITEM_NO"]
+    ]
+    assert comp and comp[0].confidence == ConfidenceLevel.LOW

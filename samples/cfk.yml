@@ -1,0 +1,13 @@
+# Config for scanning the synthetic composite-FK test schema (see composite_demo.sql).
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "CFKDEMO"
+  password: "oracle"
+  schema: "CFKDEMO"
+
+llm:
+  provider: "heuristic"
+
+output:
+  dir: "samples/out"
+  name: "cfk_map"

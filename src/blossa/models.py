@@ -137,6 +137,7 @@ class TableInfo(BaseModel):
     """A table with its columns, constraints and (optional) data profiles."""
 
     name: str
+    owner: str | None = None  # schema/owner; set on every introspected table, None in fixtures
     comment: str | None = None
     num_rows: int | None = None  # optimizer stat from ALL_TABLES (may be stale / None)
     columns: list[ColumnInfo] = Field(default_factory=list)
@@ -180,6 +181,13 @@ class Relationship(BaseModel):
     declared: bool
     confidence: ConfidenceLevel = ConfidenceLevel.HIGH
     evidence: list[str] = Field(default_factory=list)
+    # Owners are populated for multi-schema scans; None (and equal) for single-schema.
+    from_owner: str | None = None
+    to_owner: str | None = None
+
+    @property
+    def cross_schema(self) -> bool:
+        return bool(self.from_owner and self.to_owner and self.from_owner != self.to_owner)
 
 
 class Finding(BaseModel):

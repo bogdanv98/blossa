@@ -1,0 +1,14 @@
+# Multi-schema scan: HR and EXTSALES together, so EXTSALES's cross-schema FKs into HR
+# can be rediscovered. Connect as SYSTEM for full read access across both schemas.
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "SYSTEM"
+  password: "oracle"
+  schema: ["HR", "EXTSALES"]
+
+llm:
+  provider: "heuristic"
+
+output:
+  dir: "samples/out"
+  name: "cross_map"

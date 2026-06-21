@@ -20,9 +20,22 @@ class OracleConfig(BaseModel):
     dsn: str = "localhost:1521/XEPDB1"
     user: str = "blossa_demo"
     password: str = "blossa_demo"
-    schema_name: str | None = Field(default=None, alias="schema")
+    # One schema (str), several (list), or "*" for every non-system schema. None = the login user.
+    schema_name: str | list[str] | None = Field(default=None, alias="schema")
 
     model_config = {"populate_by_name": True}
+
+    @property
+    def scan_all_non_system(self) -> bool:
+        """True when the user asked to scan every non-system schema (schema: "*")."""
+        return isinstance(self.schema_name, str) and self.schema_name.strip() == "*"
+
+    def explicit_owners(self) -> list[str]:
+        """The explicitly-listed owners (upper-cased), or [] for login-user / "*" mode."""
+        if self.scan_all_non_system or self.schema_name is None:
+            return []
+        names = [self.schema_name] if isinstance(self.schema_name, str) else self.schema_name
+        return [n.strip().upper() for n in names if n and n.strip()]
 
 
 class OllamaConfig(BaseModel):

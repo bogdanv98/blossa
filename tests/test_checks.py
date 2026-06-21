@@ -205,3 +205,68 @@ def test_composite_fk_offline_is_low_confidence():
         r for r in relationships if not r.declared and r.from_columns == ["ORDER_ID", "ITEM_NO"]
     ]
     assert comp and comp[0].confidence == ConfidenceLevel.LOW
+
+
+# --------------------------------------------------------- cross-schema (multi-owner) FK inference
+
+
+def _owned(name: str, owner: str, cols, key_cols) -> TableInfo:
+    return TableInfo(
+        name=name,
+        owner=owner,
+        columns=cols,
+        constraints=[
+            ConstraintInfo(name=f"PK_{name}", type=ConstraintType.PRIMARY_KEY, columns=key_cols)
+        ],
+    )
+
+
+def _cross_schema() -> SchemaInfo:
+    """HR owns EMPLOYEES/LOCATIONS; a separate EXT schema's SALES_CONTACTS points into both —
+    LOCATION_ID by exact name, REP_ID by '_ID' suffix. The merged schema carries owner per table."""
+    employees = _owned("EMPLOYEES", "HR", [_num("EMPLOYEE_ID", 6)], ["EMPLOYEE_ID"])
+    locations = _owned("LOCATIONS", "HR", [_num("LOCATION_ID", 4)], ["LOCATION_ID"])
+    contacts = _owned(
+        "SALES_CONTACTS", "EXT",
+        [_num("CONTACT_ID", 8), _num("REP_ID", 6), _num("LOCATION_ID", 4)],
+        ["CONTACT_ID"],
+    )
+    return SchemaInfo(name="HR+EXT", tables=[employees, locations, contacts])
+
+
+class _CrossFakeDB:
+    """Precise single-column overlap fake: matches the child column via its TO_CHAR("col")
+    projection so a parent column of the same name elsewhere can't be confused for the child."""
+
+    def __init__(self, overlaps: dict[tuple[str, str], float]):
+        self._overlaps = overlaps
+
+    def query(self, sql: str, binds=None):
+        for (child, parent), f in self._overlaps.items():
+            if f'TO_CHAR("{child}")' in sql and f'p."{parent}"' in sql:
+                total = 100
+                m = round(f * total)
+                return [{"DISTINCT_TOTAL": total, "MATCHED": m, "ORPHAN_ROWS": total - m}]
+        return [{"DISTINCT_TOTAL": 0, "MATCHED": 0, "ORPHAN_ROWS": 0}]
+
+
+def test_cross_schema_fks_inferred_when_both_schemas_in_scope():
+    schema = _cross_schema()
+    db = _CrossFakeDB(
+        {
+            ("LOCATION_ID", "LOCATION_ID"): 1.0,   # exact-name, into HR.LOCATIONS
+            ("REP_ID", "EMPLOYEE_ID"): 1.0,        # suffix, into HR.EMPLOYEES
+            ("REP_ID", "LOCATION_ID"): 0.1,        # decoy: same '_ID' suffix, data disagrees
+        }
+    )
+    relationships, _ = run_checks(schema, db=db, owner=None)
+    inferred = {
+        (r.from_table, tuple(r.from_columns), r.to_owner, r.to_table)
+        for r in relationships if not r.declared
+    }
+    assert ("SALES_CONTACTS", ("LOCATION_ID",), "HR", "LOCATIONS") in inferred
+    assert ("SALES_CONTACTS", ("REP_ID",), "HR", "EMPLOYEES") in inferred
+
+    rep = next(r for r in relationships if r.from_columns == ["REP_ID"])
+    assert rep.cross_schema and rep.from_owner == "EXT" and rep.to_owner == "HR"
+    assert any("cross-schema" in e for e in rep.evidence)

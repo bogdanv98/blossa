@@ -45,8 +45,9 @@ class Database:
 
     @property
     def effective_schema(self) -> str:
-        """The owner whose objects we introspect — explicit config, else the connecting user."""
-        return (self._config.schema_name or self._config.user).upper()
+        """The primary owner to introspect — first explicit schema, else the connecting user."""
+        owners = self._config.explicit_owners()
+        return owners[0] if owners else self._config.user.upper()
 
     def query(self, sql: str, binds: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         if self._conn is None:

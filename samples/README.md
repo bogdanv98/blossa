@@ -103,6 +103,30 @@ blossa eval -t samples/cfk_truth.json -s samples/out/cfk_map.json
 
 (On Windows/Git Bash, prefix the `docker exec ... @/tmp/...` lines with `MSYS_NO_PATHCONV=1`.)
 
+## Multi-schema scanning + cross-schema FKs
+
+A scan can cover more than one schema at once. In a config's `oracle.schema`, pass a single name
+(as before), a **list** (`["HR", "OE"]`), or `"*"` for **every non-system schema**. With several
+schemas in scope, foreign keys that point *across* schemas become rediscoverable — a single-schema
+scan can't find them because the parent key lives in a schema it never looked at.
+
+[cross_schema_demo.sql](cross_schema_demo.sql) builds a synthetic `EXTSALES` schema with two
+cross-schema FKs into HR (`SALES_CONTACTS.location_id -> HR.LOCATIONS`, exact name;
+`SALES_CONTACTS.rep_id -> HR.EMPLOYEES`, by `_ID` suffix + data). Capture truth on EXTSALES alone,
+strip it, then scan **both** schemas with [crossscan.yml](crossscan.yml) (`schema: ["HR","EXTSALES"]`):
+
+```bash
+docker cp samples/cross_schema_demo.sql blossa-oracle:/tmp/cross_schema_demo.sql
+docker exec -i blossa-oracle sqlplus -s system/oracle@//localhost:1521/XEPDB1 @/tmp/cross_schema_demo.sql
+blossa ground-truth -c samples/extsales.yml -o samples/extsales_truth.json
+docker exec -i blossa-oracle sqlplus -s EXTSALES/oracle@//localhost:1521/XEPDB1 @/tmp/legacy_ify.sql
+blossa scan -c samples/crossscan.yml --llm-provider heuristic
+blossa eval -t samples/extsales_truth.json -s samples/out/cross_map.json   # FK recall = 100% (2/2)
+```
+
+Cross-schema relationships are flagged `(cross-schema)` in the map and carry `from_owner`/`to_owner`
+in the JSON. (On Windows/Git Bash, prefix the `docker exec ... @/tmp/...` lines with `MSYS_NO_PATHCONV=1`.)
+
 ## Note
 
 These are throwaway sample databases meant for testing. `legacy_ify.sql` is **destructive** — only

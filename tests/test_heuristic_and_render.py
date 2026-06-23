@@ -1,8 +1,18 @@
+from datetime import UTC, datetime
+
 from blossa.checks import run_checks
 from blossa.config import Settings
 from blossa.demo import build_demo_schema
 from blossa.llm.heuristic import HeuristicProvider
-from blossa.models import ConfidenceLevel
+from blossa.models import (
+    ColumnInfo,
+    ConfidenceLevel,
+    Relationship,
+    ScanMetadata,
+    ScanReport,
+    SchemaInfo,
+    TableInfo,
+)
 from blossa.pipeline import run_scan_over_schema
 from blossa.render import render_json, render_markdown
 from blossa.summary import build_summaries
@@ -50,3 +60,43 @@ def test_full_demo_pipeline_renders_md_and_json():
     # Sanity: a raw value must not appear in the rendered artifacts either.
     assert "carmen.i@mail.example" not in md
     assert "carmen.i@mail.example" not in data
+
+    # Single-schema maps stay flat — no per-owner grouping or qualified names.
+    assert "## Schema:" not in md
+    assert "<a id=" not in md
+
+
+def _owned_table(name: str, owner: str) -> TableInfo:
+    return TableInfo(name=name, owner=owner, columns=[ColumnInfo(name="ID", data_type="NUMBER")])
+
+
+def _multi_schema_report() -> ScanReport:
+    schema = SchemaInfo(
+        name="HR+EXT",
+        tables=[_owned_table("EMPLOYEES", "HR"), _owned_table("SALES_CONTACTS", "EXT")],
+    )
+    rel = Relationship(
+        from_table="SALES_CONTACTS", from_columns=["ID"],
+        to_table="EMPLOYEES", to_columns=["ID"], declared=False,
+        from_owner="EXT", to_owner="HR",
+    )
+    meta = ScanMetadata(
+        blossa_version="0.0.0", schema_name=schema.name,
+        generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        llm_provider="heuristic", table_count=2,
+    )
+    return ScanReport(metadata=meta, schema_info=schema, relationships=[rel])
+
+
+def test_multi_schema_map_groups_by_owner():
+    md = render_markdown(_multi_schema_report())
+    # Header counts the schemas; both the glance and the details group under per-owner headings.
+    assert "across **2** schemas (HR, EXT)" in md
+    assert "## Schema: HR" in md
+    assert "## Schema: EXT" in md
+    # Tables are owner-qualified and the glance links resolve via explicit anchors.
+    assert "`HR.EMPLOYEES`" in md
+    assert "(#ext-sales_contacts)" in md
+    assert '<a id="ext-sales_contacts"></a>' in md
+    # The cross-schema relationship is labelled as such.
+    assert "_(cross-schema)_" in md

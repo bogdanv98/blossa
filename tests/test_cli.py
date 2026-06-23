@@ -20,23 +20,46 @@ def test_scan_demo_writes_artifacts(tmp_path):
     assert (out / "database_map.json").exists()
 
 
-def test_init_writes_config(tmp_path):
+def test_init_writes_config_and_grant_script(tmp_path):
     cfg = tmp_path / "blossa.local.yml"
-    # Answers: DSN (default), user (default), schema (blank), store-pw? n, provider heuristic.
-    answers = "\n\n\nn\nheuristic\n"
+    # Answers: DSN (default), account (default), profile (default scoped), schemas, store-pw? n,
+    # provider heuristic.
+    answers = "\n\n\nHR\nn\nheuristic\n"
     result = runner.invoke(app, ["init", "--output", str(cfg)], input=answers)
-    assert result.exit_code == 0, result.stdout
+    assert result.exit_code == 0, result.output
     assert cfg.exists()
 
     data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
     assert data["llm"]["provider"] == "heuristic"
+    assert data["oracle"]["catalog_scope"] == "scoped"
+    assert data["oracle"]["schema"] == "HR"
+    assert data["oracle"]["user"] == "BLOSSA_ASSISTANT"
     assert "password" not in data["oracle"]  # we declined storing it
+
+    grants = tmp_path / "blossa_grants.sql"
+    assert grants.exists()
+    sql = grants.read_text(encoding="utf-8")
+    assert "CREATE USER BLOSSA_ASSISTANT" in sql
+    assert "GRANT READ" in sql and "'HR'" in sql  # scoped grant for HR
+
+
+def test_init_full_profile_grants_catalog_role(tmp_path):
+    cfg = tmp_path / "blossa.local.yml"
+    # DSN, account, profile=full, scan-schema (blank → "*"), store-pw n, provider heuristic.
+    answers = "\n\nfull\n\nn\nheuristic\n"
+    result = runner.invoke(app, ["init", "--output", str(cfg)], input=answers)
+    assert result.exit_code == 0, result.output
+    data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    assert data["oracle"]["catalog_scope"] == "full"
+    assert data["oracle"]["schema"] == "*"
+    sql = (tmp_path / "blossa_grants.sql").read_text(encoding="utf-8")
+    assert "READ ANY TABLE" in sql and "SELECT_CATALOG_ROLE" in sql
 
 
 def test_init_refuses_overwrite_without_force(tmp_path):
     cfg = tmp_path / "blossa.local.yml"
     cfg.write_text("oracle: {}\n", encoding="utf-8")
-    result = runner.invoke(app, ["init", "--output", str(cfg)], input="\n\n\nn\nheuristic\n")
+    result = runner.invoke(app, ["init", "--output", str(cfg)], input="\n\n\nHR\nn\nheuristic\n")
     assert result.exit_code == 1
     assert cfg.read_text(encoding="utf-8") == "oracle: {}\n"  # left untouched
 

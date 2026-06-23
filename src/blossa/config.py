@@ -22,8 +22,17 @@ class OracleConfig(BaseModel):
     password: str = "blossa_demo"
     # One schema (str), several (list), or "*" for every non-system schema. None = the login user.
     schema_name: str | list[str] | None = Field(default=None, alias="schema")
+    # How `blossa ask` answers catalog/metadata questions:
+    #   "scoped" -> ALL_* views (only what this account may read; Oracle enforces the scope)
+    #   "full"   -> DBA_* views (the whole database; needs SELECT_CATALOG_ROLE)
+    catalog_scope: str = "scoped"
 
     model_config = {"populate_by_name": True}
+
+    @property
+    def use_dba_catalog(self) -> bool:
+        """True when catalog questions should hit the whole-database DBA_* views."""
+        return self.catalog_scope.strip().lower() == "full"
 
     @property
     def scan_all_non_system(self) -> bool:

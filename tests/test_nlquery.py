@@ -10,6 +10,7 @@ from blossa.nlquery import (
     build_ask_prompt,
     build_schema_context,
     parse_ask_response,
+    privilege_hint,
     validate_read_only_select,
     with_row_limit,
 )
@@ -115,3 +116,29 @@ def test_prompt_includes_question_and_output_contract():
     prompt = build_ask_prompt("how many customers are there?", _demo_report())
     assert "how many customers are there?" in prompt
     assert '"sql"' in prompt and '"confidence"' in prompt
+
+
+def test_prompt_catalog_views_follow_scope():
+    report = _demo_report()
+    scoped = build_ask_prompt("how many schemas?", report, use_dba=False)
+    full = build_ask_prompt("how many schemas?", report, use_dba=True)
+    # Scoped exposes the ALL_* views (Oracle limits them to granted objects); not the DBA_* ones.
+    assert "ALL_TABLES" in scoped and "DBA_USERS" not in scoped
+    # Full exposes the whole-database DBA_* views.
+    assert "DBA_USERS" in full and "DBA_TABLES" in full
+
+
+# --------------------------------------------------------- catalog privilege hint
+
+
+_DENIED = "ORA-00942: table or view does not exist"
+
+
+def test_privilege_hint_fires_on_denied_dba_query():
+    hint = privilege_hint("SELECT COUNT(*) FROM DBA_USERS", _DENIED)
+    assert hint and "SELECT_CATALOG_ROLE" in hint
+
+
+def test_privilege_hint_silent_for_all_views_and_other_errors():
+    assert privilege_hint("SELECT * FROM ALL_TABLES", _DENIED) is None
+    assert privilege_hint("SELECT * FROM DBA_USERS", "ORA-12170: connection timeout") is None

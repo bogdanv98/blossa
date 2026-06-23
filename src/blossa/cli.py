@@ -21,6 +21,7 @@ from .db.introspect import introspect_schema
 from .diagnostics import Status, run_diagnostics
 from .diagnostics import check_llm as diag_check_llm
 from .evaluation import build_ground_truth, evaluate
+from .grants import build_grants_sql
 from .llm import get_provider
 from .models import ScanReport
 from .nlquery import (
@@ -28,6 +29,7 @@ from .nlquery import (
     UnsafeQueryError,
     build_ask_prompt,
     parse_ask_response,
+    privilege_hint,
     validate_read_only_select,
     with_row_limit,
 )
@@ -201,7 +203,8 @@ def ask(
 
     _status("Translating your question to SQL ...")
     try:
-        raw = provider.generate(ASK_SYSTEM_PROMPT, build_ask_prompt(question, report))
+        prompt = build_ask_prompt(question, report, use_dba=settings.oracle.use_dba_catalog)
+        raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
     except Exception as exc:  # noqa: BLE001
         err.print(f"[bold red]The model call failed:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -238,6 +241,9 @@ def ask(
             rows = db.query(with_row_limit(safe_sql, max_rows))
     except Exception as exc:  # noqa: BLE001
         err.print(f"[bold red]Query failed:[/bold red] {exc}")
+        hint = privilege_hint(safe_sql, str(exc))
+        if hint:
+            err.print(f"  [dim]{hint}[/dim]")
         raise typer.Exit(code=1) from exc
 
     _print_rows(rows, max_rows)
@@ -376,7 +382,7 @@ def init(
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config file."),
 ) -> None:
-    """Interactive first-run setup - writes a blossa.local.yml you can scan with."""
+    """Interactive first-run setup - writes blossa.local.yml + a DBA grant script you can run."""
     if output.exists() and not force:
         err.print(f"[yellow]{output} already exists.[/yellow] Re-run with --force to overwrite.")
         raise typer.Exit(code=1)
@@ -385,16 +391,31 @@ def init(
 
     console.print("[bold]1) Oracle connection (read-only)[/bold]")
     dsn = typer.prompt("  DSN (host:port/service)", default="localhost:1521/XEPDB1")
-    user = typer.prompt("  Username", default="blossa_demo")
-    schema = typer.prompt(
-        "  Schema/owner to scan (blank = same as user)", default="", show_default=False
-    )
+    user = typer.prompt("  Account Blossa connects as", default="BLOSSA_ASSISTANT")
+
+    console.print("\n[bold]2) Access profile[/bold]")
+    console.print("  [dim]scoped = read only the schemas you list (safe default) | "
+                  "full = read the whole database (needs SELECT_CATALOG_ROLE)[/dim]")
+    profile = typer.prompt("  Profile [scoped/full]", default="scoped").strip().lower()
+    schemas: list[str] = []
+    schema_cfg: str | list[str] | None = None
+    if profile == "full":
+        raw_schema = typer.prompt(
+            "  Schema(s) to scan (blank = all non-system)", default="", show_default=False
+        )
+        schema_cfg = raw_schema.strip() or "*"
+    else:
+        profile = "scoped"
+        raw_schemas = typer.prompt("  Schemas Blossa may read (comma-separated, e.g. HR, SALES)")
+        schemas = [s.strip().upper() for s in raw_schemas.split(",") if s.strip()]
+        schema_cfg = schemas[0] if len(schemas) == 1 else schemas
+
     store_pw = typer.confirm("  Store the password in the file? (not recommended)", default=False)
     password = ""
     if store_pw:
         password = typer.prompt("  Password", hide_input=True, default="", show_default=False)
 
-    console.print("\n[bold]2) LLM provider for the semantic pass[/bold]")
+    console.print("\n[bold]3) LLM provider for the semantic pass[/bold]")
     console.print("  [dim]ollama = local model (private) | heuristic = offline, no model | "
                   "openai_compatible = remote endpoint[/dim]")
     provider = typer.prompt("  Provider [ollama/heuristic/openai_compatible]", default="ollama")
@@ -403,11 +424,11 @@ def init(
         ollama_model = typer.prompt("  Ollama model", default="qwen2.5:14b")
 
     data: dict = {
-        "oracle": {"dsn": dsn, "user": user},
+        "oracle": {"dsn": dsn, "user": user, "catalog_scope": profile},
         "llm": {"provider": provider},
     }
-    if schema.strip():
-        data["oracle"]["schema"] = schema.strip()
+    if schema_cfg:
+        data["oracle"]["schema"] = schema_cfg
     if password:
         data["oracle"]["password"] = password
     if provider == "ollama":
@@ -415,6 +436,20 @@ def init(
 
     output.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     console.print(f"\n[bold green]Wrote[/bold green] {output}")
+
+    # Emit the grant script for a DBA to review and run (Blossa never runs it itself).
+    grants_path = output.parent / "blossa_grants.sql"
+    try:
+        grants_sql = build_grants_sql(user, profile, schemas or None)
+        grants_path.write_text(grants_sql, encoding="utf-8")
+        console.print(f"[bold green]Wrote[/bold green] {grants_path}  [dim](grant script)[/dim]")
+        console.print(
+            f"  [dim]Hand {grants_path.name} to a DBA to review and run — it creates the "
+            f"read-only account [bold]{user}[/bold]. Blossa never runs it itself.[/dim]"
+        )
+    except ValueError as exc:
+        err.print(f"  [yellow]Skipped grant script:[/yellow] {exc}")
+
     if not password:
         console.print("  [dim]Set the password before scanning:[/dim] "
                       "export BLOSSA_ORACLE__PASSWORD=...")

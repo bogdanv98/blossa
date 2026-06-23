@@ -156,8 +156,27 @@ blindly. The query is validated to be a single read-only SELECT before it runs (
 is a READ ONLY transaction regardless). Results are shown to you only — they are not sent back to the
 model. Use `--dry-run` to see the SQL without executing it, and `--max-rows` to cap the output.
 
+`ask` also answers questions about the **database itself** (how many schemas, which tables exist,
+row counts, columns, constraints) from Oracle's data dictionary — see _Access_ below for how the
+`scoped` vs `full` profile decides whether that covers just your schemas or the whole database.
+
 `ask` needs a model provider (Ollama / OpenAI-compatible) — the offline heuristic can't translate
 language to SQL.
+
+## Access: a least-privilege read-only account
+
+Blossa is designed to run as a dedicated, read-only account — **never** as SYSTEM/SYS. `blossa init`
+asks how much you want it to see and **generates a `blossa_grants.sql` script for your DBA to review
+and run** (Blossa never creates the account or grants itself). Two profiles:
+
+- **scoped** (default, recommended) — `READ` on only the schemas you list. Oracle then limits both
+  the data *and* the catalog questions (via the `ALL_*` views) to exactly those schemas — the scope
+  is enforced by the database, not by Blossa. Easiest for a DBA to approve.
+- **full** — `READ ANY TABLE` + `SELECT_CATALOG_ROLE`: read the whole database and answer catalog
+  questions over the `DBA_*` views. Opt-in, for teams that want the complete picture.
+
+The `oracle.catalog_scope: scoped | full` config flag (default `scoped`) tells `ask`/`serve` which
+data-dictionary views to use. The connection always runs in a READ ONLY transaction regardless.
 
 ## Web UI (browse + ask in a browser)
 

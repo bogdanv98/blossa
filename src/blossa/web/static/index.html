@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026 Bogdan Voinea  ·  SPDX-License-Identifier: AGPL-3.0-only -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Blossa</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">🌸 <strong>Blossa</strong> <span id="schema-name" class="muted"></span></div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="ask">Ask</button>
+      <button class="tab" data-tab="schema">Schema</button>
+    </nav>
+  </header>
+
+  <!-- ASK -------------------------------------------------------------------->
+  <main id="tab-ask" class="tab-panel active">
+    <form id="ask-form" class="ask-bar">
+      <input id="question" type="text" autocomplete="off"
+             placeholder="Ask in plain language, e.g. how many employees per department?" />
+      <button type="submit" id="ask-btn">Ask</button>
+    </form>
+    <p class="muted small">
+      The model sees only the schema map — never your data. The SQL below is what will run; you can
+      edit it. Queries are read-only; results are shown here only and never sent to the model.
+    </p>
+
+    <div id="ask-status" class="status"></div>
+
+    <section id="answer" class="hidden">
+      <div class="sql-head">
+        <h3>SQL <span id="confidence" class="badge"></span></h3>
+        <button id="run-btn" type="button">Run ▸</button>
+      </div>
+      <textarea id="sql" spellcheck="false" rows="4"></textarea>
+      <p id="explanation" class="muted"></p>
+      <ul id="assumptions" class="assumptions"></ul>
+
+      <div id="run-status" class="status"></div>
+      <div id="results"></div>
+    </section>
+  </main>
+
+  <!-- SCHEMA ----------------------------------------------------------------->
+  <main id="tab-schema" class="tab-panel">
+    <div class="schema-layout">
+      <aside class="table-list">
+        <input id="table-search" type="text" placeholder="Search tables…" autocomplete="off" />
+        <ul id="tables"></ul>
+      </aside>
+      <section id="table-detail" class="table-detail">
+        <p class="muted">Select a table to see its columns, meanings and relationships.</p>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

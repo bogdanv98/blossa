@@ -1,0 +1,95 @@
+/* Copyright (c) 2026 Bogdan Voinea · SPDX-License-Identifier: AGPL-3.0-only */
+:root {
+  --bg: #f7f7f8;
+  --panel: #ffffff;
+  --ink: #1c1c22;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #b3457a;
+  --accent-ink: #fff;
+  --high: #16a34a;
+  --medium: #d97706;
+  --low: #dc2626;
+  --code-bg: #1e1e2e;
+  --code-ink: #e6e6f0;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.brand { font-size: 18px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.hidden { display: none; }
+
+.tabs { display: flex; gap: 4px; }
+.tab {
+  border: none; background: transparent; color: var(--muted);
+  padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 15px;
+}
+.tab.active { background: var(--bg); color: var(--ink); font-weight: 600; }
+
+.tab-panel { display: none; padding: 22px; max-width: 1100px; margin: 0 auto; }
+.tab-panel.active { display: block; }
+
+/* Ask ------------------------------------------------------------------- */
+.ask-bar { display: flex; gap: 8px; }
+#question {
+  flex: 1; padding: 12px 14px; font-size: 16px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+}
+button {
+  background: var(--accent); color: var(--accent-ink); border: none;
+  padding: 0 18px; border-radius: 10px; font-size: 15px; cursor: pointer;
+}
+button:disabled { opacity: .55; cursor: default; }
+
+.status { min-height: 20px; margin: 12px 0; color: var(--muted); }
+.status.error { color: var(--low); }
+
+#answer { margin-top: 8px; }
+.sql-head { display: flex; align-items: center; justify-content: space-between; }
+.sql-head h3 { margin: 8px 0; }
+#sql {
+  width: 100%; font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--code-bg); color: var(--code-ink);
+  border: none; border-radius: 10px; padding: 14px; resize: vertical;
+}
+.assumptions { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 14px; }
+
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; color: #fff; vertical-align: middle; }
+.badge.high { background: var(--high); }
+.badge.medium { background: var(--medium); }
+.badge.low { background: var(--low); }
+
+/* Results / schema tables ----------------------------------------------- */
+table { border-collapse: collapse; width: 100%; background: var(--panel); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
+th { background: #fafafa; font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+#results { margin-top: 12px; overflow-x: auto; }
+.result-note { margin-top: 8px; }
+
+/* Schema browser -------------------------------------------------------- */
+.schema-layout { display: grid; grid-template-columns: 280px 1fr; gap: 18px; }
+.table-list input {
+  width: 100%; padding: 9px 12px; border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 10px; background: var(--panel);
+}
+.table-list ul { list-style: none; margin: 0; padding: 0; max-height: 70vh; overflow-y: auto; }
+.table-list li {
+  padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 14px;
+}
+.table-list li:hover { background: var(--panel); }
+.table-list li.active { background: var(--accent); color: #fff; }
+.table-detail h2 { margin: 4px 0; }
+.table-detail .purpose { color: var(--muted); margin: 4px 0 14px; }
+.rels { margin: 14px 0 0; padding-left: 18px; font-size: 14px; }
+.pill { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--line); color: var(--ink); }

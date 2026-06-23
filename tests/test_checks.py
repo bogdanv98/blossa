@@ -207,6 +207,111 @@ def test_composite_fk_offline_is_low_confidence():
     assert comp and comp[0].confidence == ConfidenceLevel.LOW
 
 
+def _twin_surrogate_pk_schema() -> SchemaInfo:
+    """Two unrelated tables each with a single-column surrogate PK named REC_ID. Their id ranges
+    overlap by coincidence, but neither references the other — the classic surrogate-collision
+    false positive that the symmetric-PK guard must suppress."""
+    def _txt(name: str) -> ColumnInfo:
+        return ColumnInfo(name=name, data_type="VARCHAR2", data_length=20)
+
+    def _pk(name: str, cols: list[str]) -> ConstraintInfo:
+        return ConstraintInfo(name=name, type=ConstraintType.PRIMARY_KEY, columns=cols)
+
+    a = TableInfo(name="ALPHA", columns=[_num("REC_ID", 10), _txt("LABEL")],
+                  constraints=[_pk("PK_A", ["REC_ID"])])
+    b = TableInfo(name="BETA", columns=[_num("REC_ID", 10), _txt("NOTE")],
+                  constraints=[_pk("PK_B", ["REC_ID"])])
+    return SchemaInfo(name="TWIN", tables=[a, b])
+
+
+class _FullOverlapDB:
+    """Every value-overlap query returns 100% — so only the inference guards, not the data, can
+    stop a candidate FK from being emitted."""
+
+    def query(self, sql: str, binds=None):
+        return [{"DISTINCT_TOTAL": 5, "MATCHED": 5, "ORPHAN_ROWS": 0}]
+
+
+def test_symmetric_surrogate_pk_collision_suppressed():
+    schema = _twin_surrogate_pk_schema()
+    relationships, _ = run_checks(schema, db=_FullOverlapDB(), owner="TWIN")
+    inferred = [r for r in relationships if not r.declared]
+    # Despite identical names and full value overlap in BOTH directions, neither surrogate PK is
+    # reported as a foreign key to the other.
+    assert not any(r.from_columns == ["REC_ID"] for r in inferred)
+
+
+def _composite_suffix_schema() -> SchemaInfo:
+    """ORDER_ITEMS has composite PK (ORDER_ID, ITEM_NO). RETURN_LINES references it, but its
+    columns are role-named (SOURCE_ORDER_ID, RETURN_ITEM_NO) — no exact-name overlap, so only the
+    suffix+type+tuple-overlap pass can rediscover it. RETURN_ID is a decoy '_ID' column."""
+    order_items = TableInfo(
+        name="ORDER_ITEMS",
+        columns=[
+            _num("ORDER_ID", 8),
+            _num("ITEM_NO", 4),
+            ColumnInfo(name="PRODUCT", data_type="VARCHAR2", data_length=40),
+        ],
+        constraints=[
+            ConstraintInfo(
+                name="PK_OI", type=ConstraintType.PRIMARY_KEY, columns=["ORDER_ID", "ITEM_NO"]
+            )
+        ],
+    )
+    return_lines = TableInfo(
+        name="RETURN_LINES",
+        columns=[
+            _num("RETURN_ID", 10),
+            _num("SOURCE_ORDER_ID", 8),
+            _num("RETURN_ITEM_NO", 4),
+            _num("QTY", 4),
+        ],
+        constraints=[
+            ConstraintInfo(name="PK_RL", type=ConstraintType.PRIMARY_KEY, columns=["RETURN_ID"])
+        ],
+    )
+    return SchemaInfo(name="CFK", tables=[order_items, return_lines])
+
+
+class _CompositeSuffixFakeDB:
+    """Full tuple overlap only for the correct role-named pair (SOURCE_ORDER_ID, RETURN_ITEM_NO);
+    every other combination and any single-column query gets zero overlap."""
+
+    def query(self, sql: str, binds=None):
+        if "AS C1" in sql:  # composite tuple-overlap query
+            correct = (
+                'TO_CHAR("SOURCE_ORDER_ID")' in sql and 'TO_CHAR("RETURN_ITEM_NO")' in sql
+            )
+            matched = 3 if correct else 0
+            return [{"DISTINCT_TOTAL": 3, "MATCHED": matched, "ORPHAN_ROWS": 3 - matched}]
+        return [{"DISTINCT_TOTAL": 0, "MATCHED": 0, "ORPHAN_ROWS": 0}]
+
+
+def test_composite_fk_inferred_by_suffix_and_data():
+    schema = _composite_suffix_schema()
+    relationships, _ = run_checks(schema, db=_CompositeSuffixFakeDB(), owner="CFK")
+    inferred = {
+        (r.from_table, tuple(r.from_columns), r.to_table) for r in relationships if not r.declared
+    }
+    # Rediscovered despite no exact column-name overlap — data picks the right role-named pair.
+    assert ("RETURN_LINES", ("SOURCE_ORDER_ID", "RETURN_ITEM_NO"), "ORDER_ITEMS") in inferred
+    rel = next(
+        r for r in relationships
+        if r.from_table == "RETURN_LINES" and not r.declared and len(r.from_columns) == 2
+    )
+    assert rel.to_columns == ["ORDER_ID", "ITEM_NO"]  # parent key order preserved
+    assert rel.confidence == ConfidenceLevel.HIGH
+    assert any("name suffix" in e for e in rel.evidence)
+
+
+def test_composite_suffix_fk_not_inferred_offline():
+    """Like the single-column suffix pass, composite suffix matching must NOT fire without a DB."""
+    schema = _composite_suffix_schema()
+    relationships, _ = run_checks(schema)  # no db
+    inferred = {tuple(r.from_columns) for r in relationships if not r.declared}
+    assert ("SOURCE_ORDER_ID", "RETURN_ITEM_NO") not in inferred
+
+
 # --------------------------------------------------------- cross-schema (multi-owner) FK inference
 
 

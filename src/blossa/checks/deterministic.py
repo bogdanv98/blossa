@@ -14,6 +14,8 @@ FKs are still inferred by name but flagged LOW confidence ("name match only").
 
 from __future__ import annotations
 
+import itertools
+
 from ..db.connection import QueryExecutor
 from ..models import (
     ConfidenceLevel,
@@ -103,6 +105,18 @@ def _single_col_keys(schema: SchemaInfo, fallback: str | None) -> dict[str, list
                     (owner, table.name, c.columns[0], base)
                 )
     return keys
+
+
+def _single_pk_cols(schema: SchemaInfo, fallback: str | None) -> set[tuple[str, str, str]]:
+    """Every (owner, table, column) that is its table's single-column PRIMARY key — i.e. a likely
+    surrogate key. Used to recognise (and discard) coincidental two-way PK<->PK name collisions."""
+    pks: set[tuple[str, str, str]] = set()
+    for table in schema.tables:
+        owner = _table_owner(table, fallback)
+        for c in table.constraints:
+            if c.type == ConstraintType.PRIMARY_KEY and len(c.columns) == 1:
+                pks.add((owner, table.name, c.columns[0]))
+    return pks
 
 
 def _composite_keys(schema: SchemaInfo, fallback: str | None) -> list[CompositeKey]:
@@ -204,7 +218,22 @@ def _candidate_foreign_keys(
 
     # Pass 1 — exact name match: a column named exactly like a key column elsewhere. When more
     # than one schema owns such a key, the data overlap decides which one (and, with no DB to
-    # decide, an ambiguous match is left alone).
+    # decide, an ambiguous match is left alone). Matches are collected first so we can drop
+    # symmetric primary-key collisions before emitting (see below).
+    single_pks = _single_pk_cols(schema, fb)
+    # Each pending match: (emit-args tuple, edge-key-if-PK<->PK-exact-else-None).
+    pending: list[tuple[tuple, tuple[str, str, str, str, str, str] | None]] = []
+
+    def pk_edge(child_owner: str, child_table: str, child_col: str,
+                parent_owner: str, parent_table: str, parent_col: str):
+        """The directed edge key when both endpoints are their tables' single-column primary keys
+        (the only shape that can produce a coincidental two-way collision); else None."""
+        if (child_owner, child_table, child_col) in single_pks and (
+            parent_owner, parent_table, parent_col
+        ) in single_pks:
+            return (child_owner, child_table, child_col, parent_owner, parent_table, parent_col)
+        return None
+
     for table in schema.tables:
         co = _table_owner(table, fb)
         for col in table.columns:
@@ -235,7 +264,7 @@ def _candidate_foreign_keys(
                     evidence.append(f"Type differs from parent: {col.type_signature} vs {pb}.")
                 evidence.append(f"{ov:.0%} of distinct values exist in the parent key.")
                 conf = ConfidenceLevel.HIGH if ov >= 0.99 else ConfidenceLevel.MEDIUM
-                emit(co, table.name, [col.name], po, pt, [pc], conf, evidence, orph, ov)
+                args = (co, table.name, [col.name], po, pt, [pc], conf, evidence, orph, ov)
             else:
                 if len(cands) != 1:
                     continue  # ambiguous without data to disambiguate
@@ -243,8 +272,21 @@ def _candidate_foreign_keys(
                 evidence = [name_note(po, pt, pc, co)]
                 if pb and pb != child_base:
                     evidence.append(f"Type differs from parent: {col.type_signature} vs {pb}.")
-                emit(co, table.name, [col.name], po, pt, [pc],
-                     ConfidenceLevel.LOW, evidence, 0, None)
+                args = (co, table.name, [col.name], po, pt, [pc],
+                        ConfidenceLevel.LOW, evidence, 0, None)
+            pending.append((args, pk_edge(co, table.name, col.name, po, pt, pc)))
+
+    # Drop symmetric PK<->PK collisions: if we matched both A.X -> B.X and B.X -> A.X and both
+    # columns are their tables' own single-column primary keys, neither is a real FK — it is two
+    # unrelated surrogate keys whose value ranges happen to overlap. A genuine shared-PK 1:1 FK is
+    # one-directional (the parent has rows the child does not), so its reverse never clears overlap.
+    pk_edges = {edge for (_args, edge) in pending if edge is not None}
+    for args, edge in pending:
+        if edge is not None:
+            co, ct, cc, po, pt, pc = edge
+            if (po, pt, pc, co, ct, cc) in pk_edges:
+                continue  # the reverse edge exists too — coincidental collision, skip
+        emit(*args)
 
     # Pass 2 — suffix match, confirmed by data. Catches role/self refs whose name does NOT
     # equal the key (MANAGER_ID -> EMPLOYEE_ID, or a cross-schema SALES_REP_ID -> HR.EMPLOYEES):
@@ -323,6 +365,72 @@ def _candidate_foreign_keys(
 
             emit(co, table.name, from_cols, po, pt, list(key_cols),
                  confidence, evidence, orphan_rows, overlap)
+
+    # Pass 4 — composite keys by suffix / role name, confirmed by tuple overlap. Generalises
+    # pass 3 the way pass 2 generalises pass 1: the child need not name its columns exactly like
+    # the parent key — each parent key column is matched to a child column by trailing token
+    # ("_ID", "_NO") + base type, then the whole tuple is confirmed by value overlap (the data
+    # also disambiguates when several child columns share a token). Data-gated to protect
+    # precision, so it only runs against a live database — never offline.
+    if db is not None:
+        tables_by = {(_table_owner(t, fb), t.name): t for t in schema.tables}
+        for table in schema.tables:
+            co = _table_owner(table, fb)
+            child_names = {c.name for c in table.columns}
+            for po, pt, key_cols in composite_parents:
+                if po == co and pt == table.name:
+                    continue
+                if set(key_cols).issubset(child_names):
+                    continue  # exact-name composite — pass 3 already handled it
+                parent_tbl = tables_by.get((po, pt))
+                if parent_tbl is None:
+                    continue
+                # Candidate child columns for each parent key column, by token + base type.
+                cand_lists: list[list[str]] = []
+                for pc in key_cols:
+                    pcol = parent_tbl.column(pc)
+                    pbase = _base_type(pcol.type_signature) if pcol else ""
+                    ptoken = _name_token(pc)
+                    cands = [
+                        c.name for c in table.columns
+                        if _name_token(c.name) == ptoken and _base_type(c.type_signature) == pbase
+                    ]
+                    cand_lists.append(cands)
+                if any(not cl for cl in cand_lists):
+                    continue  # at least one key column has no plausible child column
+                product_size = 1
+                for cl in cand_lists:
+                    product_size *= len(cl)
+                if product_size > 24:
+                    continue  # too ambiguous to brute-force safely; leave it alone
+                best4: tuple[float, int, tuple[str, ...]] | None = None
+                for combo in itertools.product(*cand_lists):
+                    if len(set(combo)) != len(combo):
+                        continue  # one child column can't fill two key positions
+                    if (co, table.name, tuple(combo)) in declared_pairs:
+                        continue
+                    ov, orph = _composite_value_overlap(
+                        db, co, table.name, list(combo), po, pt, list(key_cols)
+                    )
+                    if ov is None or ov < overlap_threshold:
+                        continue
+                    if best4 is None or ov > best4[0]:
+                        best4 = (ov, orph, combo)
+                if best4 is None:
+                    continue
+                ov, orph, combo = best4
+                from_cols = list(combo)
+                cross = " (cross-schema)" if po != co else ""
+                mapping = ", ".join(
+                    f"{fc}->{kc}" for fc, kc in zip(from_cols, key_cols, strict=True) if fc != kc
+                )
+                evidence = [
+                    f"Columns match {pt}'s composite key by name suffix and type{cross}"
+                    + (f" ({mapping})." if mapping else "."),
+                    f"{ov:.0%} of distinct value tuples exist in the parent key.",
+                ]
+                conf = ConfidenceLevel.HIGH if ov >= 0.99 else ConfidenceLevel.MEDIUM
+                emit(co, table.name, from_cols, po, pt, list(key_cols), conf, evidence, orph, ov)
 
     return candidates, findings
 

@@ -89,8 +89,10 @@ foreign keys Blossa failed to rediscover — exactly the cases worth improving n
 
 None of Oracle's sample schemas declare a **composite** (multi-column) foreign key, so there is
 nothing to measure composite-FK rediscovery against. [composite_demo.sql](composite_demo.sql)
-creates a tiny synthetic schema (`CFKDEMO`) whose only purpose is to contain one real composite FK:
-`ITEM_RETURNS(order_id, item_no) -> ORDER_ITEMS(order_id, item_no)`. Run it through the same flow:
+creates a tiny synthetic schema (`CFKDEMO`) with two real composite FKs into `ORDER_ITEMS`:
+`ITEM_RETURNS(order_id, item_no)` (rediscovered by **exact column name**) and
+`RETURN_LINES(source_order_id, return_item_no)` (role-named columns, rediscovered by **name
+suffix + type + tuple overlap**). Run it through the same flow:
 
 ```bash
 docker cp samples/composite_demo.sql blossa-oracle:/tmp/composite_demo.sql

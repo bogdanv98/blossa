@@ -30,23 +30,29 @@ class OllamaProvider(LLMProvider):
         except httpx.HTTPError:
             return False
 
-    def analyze(self, summary: TableSummary) -> TableSemantics:
+    def _post_chat(self, system_prompt: str, user_prompt: str) -> str:
         body = {
             "model": self._config.model,
             "stream": False,
             "format": "json",
             "options": {"temperature": 0},
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(summary)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
         }
         resp = httpx.post(
             f"{self._config.base_url}/api/chat", json=body, timeout=self._config.timeout
         )
         resp.raise_for_status()
-        content = resp.json().get("message", {}).get("content", "")
+        return resp.json().get("message", {}).get("content", "")
+
+    def analyze(self, summary: TableSummary) -> TableSemantics:
+        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary))
         return parse_response(summary, content)
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self._post_chat(system_prompt, user_prompt)
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -71,14 +77,14 @@ class OpenAICompatibleProvider(LLMProvider):
         except httpx.HTTPError:
             return False
 
-    def analyze(self, summary: TableSummary) -> TableSemantics:
+    def _post_chat(self, system_prompt: str, user_prompt: str) -> str:
         body = {
             "model": self._config.model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(summary)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
         }
         resp = httpx.post(
@@ -88,5 +94,11 @@ class OpenAICompatibleProvider(LLMProvider):
             timeout=self._config.timeout,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        return resp.json()["choices"][0]["message"]["content"]
+
+    def analyze(self, summary: TableSummary) -> TableSemantics:
+        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary))
         return parse_response(summary, content)
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        return self._post_chat(system_prompt, user_prompt)

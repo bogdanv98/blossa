@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 import yaml
 from rich.console import Console
+from rich.syntax import Syntax
 from rich.table import Table
 
 from . import __version__
@@ -22,6 +23,14 @@ from .diagnostics import check_llm as diag_check_llm
 from .evaluation import build_ground_truth, evaluate
 from .llm import get_provider
 from .models import ScanReport
+from .nlquery import (
+    ASK_SYSTEM_PROMPT,
+    UnsafeQueryError,
+    build_ask_prompt,
+    parse_ask_response,
+    validate_read_only_select,
+    with_row_limit,
+)
 from .pipeline import run_scan_over_schema, scan_oracle
 from .render import write_json, write_markdown
 
@@ -145,6 +154,110 @@ def _print_summary(report, md_path: Path, json_path: Path) -> None:
     console.print(f"  provider: {m.llm_provider}" + (f" ({m.llm_model})" if m.llm_model else ""))
     console.print(f"  [cyan]{md_path}[/cyan]")
     console.print(f"  [cyan]{json_path}[/cyan]")
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="Your question, in plain language."),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a config file."),
+    map_path: Path | None = typer.Option(
+        None, "--map", "-m", help="Scan JSON map to ground on (default: <out>/<name>.json)."
+    ),
+    llm_provider: str | None = typer.Option(None, "--llm-provider"),
+    max_rows: int = typer.Option(100, "--max-rows", help="Cap the number of rows returned."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the SQL but do not run it."),
+) -> None:
+    """Answer a natural-language question with a read-only SQL query over the scanned schema.
+
+    Grounds on the database map from `blossa scan`. The model sees only the semantic map (never
+    raw data); the generated SQL is shown to you and validated read-only before it runs.
+    """
+    settings = load_settings(config)
+    if llm_provider:
+        settings.llm.provider = llm_provider
+
+    if map_path is None:
+        map_path = Path(settings.output.dir) / f"{settings.output.name}.json"
+    if not map_path.exists():
+        err.print(
+            f"[bold red]No database map at[/bold red] {map_path}. "
+            "Run [cyan]blossa scan[/cyan] first, or point to one with [cyan]--map[/cyan]."
+        )
+        raise typer.Exit(code=1)
+    try:
+        report = ScanReport.model_validate_json(map_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Could not read the map:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if settings.llm.provider == "heuristic":
+        err.print(
+            "[bold red]`ask` needs a model provider[/bold red] (ollama or openai_compatible); "
+            "the offline heuristic can't translate questions to SQL."
+        )
+        raise typer.Exit(code=1)
+    _preflight_llm(settings)
+    provider = get_provider(settings.llm)
+
+    _status("Translating your question to SQL ...")
+    try:
+        raw = provider.generate(ASK_SYSTEM_PROMPT, build_ask_prompt(question, report))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    result = parse_ask_response(raw)
+
+    if not result.answerable:
+        err.print("[yellow]I couldn't turn that into a query for this schema.[/yellow]")
+        if result.explanation:
+            console.print(result.explanation)
+        raise typer.Exit(code=2)
+
+    console.print()
+    console.print(Syntax(result.sql, "sql", theme="ansi_dark", word_wrap=True))
+    if result.explanation:
+        console.print(f"[dim]{result.explanation}[/dim]")
+    if result.assumptions:
+        console.print("[bold]Assumptions:[/bold]")
+        for a in result.assumptions:
+            console.print(f"  - {a}")
+    console.print(f"[dim]Confidence:[/dim] {result.confidence.value}")
+
+    if dry_run:
+        console.print("[dim](--dry-run: query not executed)[/dim]")
+        return
+
+    try:
+        safe_sql = validate_read_only_select(result.sql)
+    except UnsafeQueryError as exc:
+        err.print(f"[bold red]Refusing to run this query:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        with Database(settings.oracle) as db:
+            rows = db.query(with_row_limit(safe_sql, max_rows))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Query failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    _print_rows(rows, max_rows)
+
+
+def _print_rows(rows: list[dict], max_rows: int) -> None:
+    console.print()
+    if not rows:
+        console.print("[dim]No rows returned.[/dim]")
+        return
+    table = Table(show_lines=False)
+    for col in rows[0]:
+        table.add_column(str(col), overflow="fold")
+    for r in rows:
+        table.add_row(*["" if v is None else str(v) for v in r.values()])
+    console.print(table)
+    note = f"{len(rows)} row(s)"
+    if len(rows) >= max_rows:
+        note += f", capped at --max-rows={max_rows}"
+    console.print(f"[dim]{note}. Results are shown to you only - not sent to the model.[/dim]")
 
 
 @app.command()

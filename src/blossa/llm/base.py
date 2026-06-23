@@ -58,6 +58,17 @@ class LLMProvider(ABC):
     def analyze(self, summary: TableSummary) -> TableSemantics:
         """Return inferred semantics for one PII-safe table summary."""
 
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        """Free-form (JSON) generation, used by `blossa ask` for NL→SQL.
+
+        Only model-backed providers implement this; the offline heuristic provider cannot
+        translate natural language to SQL, so it raises.
+        """
+        raise NotImplementedError(
+            f"The '{self.name}' provider cannot answer natural-language questions; "
+            "use a model provider (ollama or openai_compatible)."
+        )
+
     def available(self) -> bool:
         """Whether the provider is reachable / usable right now. Default: assume yes."""
         return True

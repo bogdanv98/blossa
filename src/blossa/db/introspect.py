@@ -120,16 +120,32 @@ _SYSTEM_SCHEMAS = (
 
 
 def list_non_system_schemas(db: QueryExecutor) -> list[str]:
-    """Every schema that actually owns a table and isn't an Oracle-maintained one."""
-    placeholders = ", ".join(f"'{s}'" for s in _SYSTEM_SCHEMAS)
-    sql = f"""
-        SELECT DISTINCT OWNER FROM ALL_TABLES
-         WHERE OWNER NOT IN ({placeholders})
-           AND OWNER NOT LIKE 'APEX_%'
-           AND OWNER NOT LIKE 'FLOWS_%'
-         ORDER BY OWNER
-    """  # noqa: S608 - the IN list is a fixed constant, not user input
-    return [r["OWNER"] for r in db.query(sql)]
+    """Every schema that actually owns a table and isn't an Oracle-maintained one.
+
+    Oracle 12.2+ flags its own schemas with ALL_USERS.ORACLE_MAINTAINED='Y', which is the
+    authoritative source — it catches internal schemas (e.g. DBSFWUSER) that a hand-kept
+    blocklist inevitably misses. On older releases that column doesn't exist, so we fall back
+    to the fixed `_SYSTEM_SCHEMAS` blocklist.
+    """
+    maintained_sql = """
+        SELECT u.USERNAME AS OWNER
+          FROM ALL_USERS u
+         WHERE u.ORACLE_MAINTAINED = 'N'
+           AND EXISTS (SELECT 1 FROM ALL_TABLES t WHERE t.OWNER = u.USERNAME)
+         ORDER BY u.USERNAME
+    """
+    try:
+        return [r["OWNER"] for r in db.query(maintained_sql)]
+    except Exception:  # noqa: BLE001 - pre-12.2 has no ORACLE_MAINTAINED; use the blocklist instead
+        placeholders = ", ".join(f"'{s}'" for s in _SYSTEM_SCHEMAS)
+        sql = f"""
+            SELECT DISTINCT OWNER FROM ALL_TABLES
+             WHERE OWNER NOT IN ({placeholders})
+               AND OWNER NOT LIKE 'APEX_%'
+               AND OWNER NOT LIKE 'FLOWS_%'
+             ORDER BY OWNER
+        """  # noqa: S608 - the IN list is a fixed constant, not user input
+        return [r["OWNER"] for r in db.query(sql)]
 
 
 def introspect_schemas(db: QueryExecutor, owners: list[str]) -> SchemaInfo:

@@ -1,0 +1,16 @@
+# Scan EVERY non-system schema at once (schema: "*"). Blossa auto-discovers the application
+# schemas via ALL_USERS.ORACLE_MAINTAINED='N' (so Oracle-internal owners like DBSFWUSER are
+# skipped), introspects them all, and rediscovers relationships within and across them.
+# Connect as SYSTEM for full read access.
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "SYSTEM"
+  password: "oracle"
+  schema: "*"
+
+llm:
+  provider: "heuristic"
+
+output:
+  dir: "samples/out"
+  name: "all_map"

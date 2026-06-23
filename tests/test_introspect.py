@@ -1,6 +1,6 @@
 """Introspection assembly logic, exercised with a fake QueryExecutor (no Oracle needed)."""
 
-from blossa.db.introspect import introspect_schema
+from blossa.db.introspect import introspect_schema, list_non_system_schemas
 
 
 class FakeDB:
@@ -81,3 +81,49 @@ def test_introspect_assembles_tables_columns_and_fk():
     assert fks[0].referenced_table == "CUSTOMERS"
     assert fks[0].referenced_columns == ["CUST_ID"]
     assert orders.indexes[0].columns == ["CUST_ID"]
+
+
+# --------------------------------------------------------- "*" non-system schema discovery
+
+
+class _MaintainedDB:
+    """A 12.2+ database: ALL_USERS exposes ORACLE_MAINTAINED, so the flag query succeeds."""
+
+    def query(self, sql: str, binds=None):
+        if "ORACLE_MAINTAINED" in sql.upper():
+            return [{"OWNER": "CFKDEMO"}, {"OWNER": "EXTSALES"}, {"OWNER": "HR"}]
+        raise AssertionError("blocklist fallback should not run when the flag query works")
+
+
+class _LegacyDB:
+    """A pre-12.2 database: querying ORACLE_MAINTAINED raises, forcing the blocklist fallback."""
+
+    def query(self, sql: str, binds=None):
+        if "ORACLE_MAINTAINED" in sql.upper():
+            raise RuntimeError("ORA-00904: invalid identifier")
+        # The fallback's ALL_TABLES query: SYS is in the blocklist, so it must not appear here.
+        return [{"OWNER": "HR"}, {"OWNER": "CFKDEMO"}]
+
+
+def test_non_system_schemas_prefers_oracle_maintained_flag():
+    assert list_non_system_schemas(_MaintainedDB()) == ["CFKDEMO", "EXTSALES", "HR"]
+
+
+def test_non_system_schemas_falls_back_to_blocklist_pre_12_2():
+    assert list_non_system_schemas(_LegacyDB()) == ["HR", "CFKDEMO"]
+
+
+def test_blocklist_fallback_query_excludes_system_owners():
+    """The fallback SQL must carry the blocklist so Oracle-maintained owners can't slip through."""
+    captured = {}
+
+    class _Capture:
+        def query(self, sql: str, binds=None):
+            if "ORACLE_MAINTAINED" in sql.upper():
+                raise RuntimeError("no such column")
+            captured["sql"] = sql
+            return []
+
+    list_non_system_schemas(_Capture())
+    assert "'SYS'" in captured["sql"] and "'SYSTEM'" in captured["sql"]
+    assert "APEX_%" in captured["sql"]

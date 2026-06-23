@@ -129,6 +129,21 @@ blossa eval -t samples/extsales_truth.json -s samples/out/cross_map.json   # FK 
 Cross-schema relationships are flagged `(cross-schema)` in the map and carry `from_owner`/`to_owner`
 in the JSON. (On Windows/Git Bash, prefix the `docker exec ... @/tmp/...` lines with `MSYS_NO_PATHCONV=1`.)
 
+### Scanning *every* application schema at once (`schema: "*"`)
+
+[allscan.yml](allscan.yml) sets `schema: "*"`, so Blossa auto-discovers the application schemas and
+scans them all together. Discovery uses `ALL_USERS.ORACLE_MAINTAINED = 'N'` (authoritative on Oracle
+12.2+), which excludes Oracle-internal owners a hand-kept blocklist would miss — e.g. `DBSFWUSER` on
+XE. On pre-12.2 it falls back to a fixed system-schema blocklist.
+
+```bash
+blossa scan -c samples/allscan.yml --llm-provider heuristic
+```
+
+Against the demo container (HR + CFKDEMO + EXTSALES installed) this discovers exactly those three
+schemas, scans all 11 tables, and re-infers every relationship — single-column, composite, and
+cross-schema — in one pass.
+
 ## Note
 
 These are throwaway sample databases meant for testing. `legacy_ify.sql` is **destructive** — only

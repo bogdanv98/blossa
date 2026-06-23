@@ -132,12 +132,31 @@ blossa scan --demo --llm-provider heuristic
 | `blossa doctor` | Check every prerequisite (Python, driver, config, Oracle, LLM, output) and report fixes. |
 | `blossa scan` | Full pipeline against the configured Oracle schema → Markdown + JSON. |
 | `blossa scan --demo` | Run against the bundled offline fixture (no Oracle needed). |
+| `blossa ask "<question>"` | Ask a plain-language question; grounds on the map, shows the SQL, runs it read-only. |
 | `blossa introspect` | Just dump the raw introspected schema as JSON (no checks, no LLM). |
 | `blossa check-llm` | Verify the configured LLM provider is reachable. |
 | `blossa ground-truth` | Capture real comments + FKs from a documented schema (for evaluation). |
 | `blossa eval` | Score a scan against ground truth: FK rediscovery + documentation coverage. |
 
 Run `blossa --help` for all flags.
+
+## Ask questions in plain language
+
+Once you have a map, a business user can query the database **without writing SQL or asking the DBA**:
+
+```bash
+blossa ask "How many employees are in each department?" --llm-provider ollama
+```
+
+Blossa grounds the model on the **semantic map** (table/column meanings + relationships — never raw
+rows), turns the question into **one read-only Oracle SELECT**, and always shows you that SQL plus
+the assumptions it made and a confidence level, so the answer can be verified rather than trusted
+blindly. The query is validated to be a single read-only SELECT before it runs (and the connection
+is a READ ONLY transaction regardless). Results are shown to you only — they are not sent back to the
+model. Use `--dry-run` to see the SQL without executing it, and `--max-rows` to cap the output.
+
+`ask` needs a model provider (Ollama / OpenAI-compatible) — the offline heuristic can't translate
+language to SQL.
 
 ## See an example
 
@@ -157,10 +176,10 @@ schemas (HR / OE).
 
 In: read-only Oracle introspection (single, multi-, or all-schema), deterministic schema analysis
 incl. self / composite / cross-schema FK inference, PII-safe summaries, a local-LLM semantic pass,
-Markdown + JSON output.
+Markdown + JSON output, and a single-shot natural-language → read-only SQL command (`ask`).
 
-Out (for now): web UI, chat interface, any write access, non-Oracle engines, query-log/lineage
-ingestion, managed cloud, model fine-tuning.
+Out (for now): web UI, multi-turn conversational chat, any write access, non-Oracle engines,
+query-log/lineage ingestion, managed cloud, model fine-tuning.
 
 ## Develop & release
 

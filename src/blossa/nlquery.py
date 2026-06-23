@@ -58,19 +58,61 @@ class AskResult(BaseModel):
 
 ASK_SYSTEM_PROMPT = (
     "You are a careful data-analyst assistant. You translate a business user's natural-language "
-    "question into exactly ONE read-only Oracle SQL query, using a provided semantic map of the "
-    "database (tables, columns with inferred business meaning, and relationships).\n\n"
+    "question into exactly ONE read-only Oracle SQL query.\n\n"
+    "You are given a semantic map of the application schema(s) — tables, columns with inferred "
+    "business meaning, and relationships — and a short 'Catalog views' list of Oracle "
+    "data-dictionary views for questions about the database itself.\n\n"
     "Rules:\n"
     "- Produce exactly ONE statement: a SELECT (a leading WITH ... SELECT is fine). NEVER write "
     "INSERT, UPDATE, DELETE, MERGE or any DDL.\n"
-    "- Use ONLY tables and columns that appear in the map. Qualify columns when ambiguous.\n"
-    "- Use the listed relationships for joins. Reference tables by the names shown in the map "
-    "(owner-qualified when the name contains a dot).\n"
+    "- For questions about the DATA, use ONLY tables and columns from the map. Qualify columns "
+    "when ambiguous, use the listed relationships for joins, and reference tables by the names "
+    "shown in the map (owner-qualified when the name contains a dot).\n"
+    "- For questions about the DATABASE ITSELF (how many schemas, which tables exist, row counts, "
+    "columns, constraints), use ONLY the views under 'Catalog views' below — exactly those view "
+    "names, never another variant.\n"
     "- Write standard Oracle SQL.\n"
-    "- If the question cannot be answered from this schema, set \"sql\" to \"\" and explain why.\n"
+    "- If the question cannot be answered, set \"sql\" to \"\" and explain why.\n"
     "- List every assumption you made (which column you picked, how you read a date or filter).\n"
     "- Respond with STRICT JSON only — no prose, no markdown fences."
 )
+
+# Catalog/metadata views, by scope. "scoped" uses ALL_* — Oracle limits these to objects this
+# account may read, so answers are naturally confined to the granted schemas. "full" uses DBA_*
+# (the whole database; needs SELECT_CATALOG_ROLE).
+CATALOG_REFERENCE_SCOPED = (
+    "- ALL_TABLES(OWNER, TABLE_NAME, NUM_ROWS): tables this account can read. NUM_ROWS is an "
+    "approximate optimizer statistic (may be stale/NULL) — for an exact count of one table use "
+    "COUNT(*).\n"
+    "- ALL_TAB_COLUMNS(OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE): columns per table.\n"
+    "- ALL_CONSTRAINTS(OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, "
+    "R_CONSTRAINT_NAME): 'P'=primary key, 'R'=foreign key, 'U'=unique, 'C'=check.\n"
+    "- ALL_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects this account can see.\n"
+    "- ALL_USERS(USERNAME, ORACLE_MAINTAINED): use ONLY to tell application owners "
+    "(ORACLE_MAINTAINED='N') from Oracle-internal ones; never list schemas from it directly — it "
+    "shows every user, not just what this account can read.\n"
+    "- ALL_TAB_COMMENTS / ALL_COL_COMMENTS: documentation comments.\n"
+    "These ALL_* views show only objects this account may read, so answers are limited to the "
+    "granted schemas. To list/count the application schemas in scope, take DISTINCT OWNER from "
+    "ALL_TABLES and keep only owners with ALL_USERS.ORACLE_MAINTAINED='N' (this drops SYS/SYSTEM/"
+    "XDB and other Oracle-internal owners that appear via public grants)."
+)
+CATALOG_REFERENCE_FULL = (
+    "- DBA_USERS(USERNAME, ORACLE_MAINTAINED, ACCOUNT_STATUS, CREATED): every user/schema. "
+    "Application schemas have ORACLE_MAINTAINED = 'N' — exclude the others when counting apps.\n"
+    "- DBA_TABLES(OWNER, TABLE_NAME, NUM_ROWS): all tables. NUM_ROWS is an approximate optimizer "
+    "statistic (may be stale/NULL) — for an exact count of one table use COUNT(*).\n"
+    "- DBA_TAB_COLUMNS(OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE): all columns.\n"
+    "- DBA_CONSTRAINTS(OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, "
+    "R_CONSTRAINT_NAME): 'P'=primary key, 'R'=foreign key, 'U'=unique, 'C'=check.\n"
+    "- DBA_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): all objects.\n"
+    "- DBA_TAB_COMMENTS / DBA_COL_COMMENTS: documentation comments."
+)
+
+
+def catalog_reference(use_dba: bool) -> str:
+    return CATALOG_REFERENCE_FULL if use_dba else CATALOG_REFERENCE_SCOPED
+
 
 _ASK_OUTPUT_CONTRACT = (
     "Respond with JSON of exactly this shape:\n"
@@ -139,10 +181,12 @@ def build_schema_context(report: ScanReport) -> dict:
     return {"schema": report.schema_info.name, "tables": tables, "relationships": relationships}
 
 
-def build_ask_prompt(question: str, report: ScanReport) -> str:
-    context = build_schema_context(report)
+def build_ask_prompt(question: str, report: ScanReport, *, use_dba: bool = False) -> str:
+    context = json.dumps(build_schema_context(report), indent=2, default=str)
+    catalog = catalog_reference(use_dba)
     return (
-        f"Database map (semantic, PII-safe JSON):\n{json.dumps(context, indent=2, default=str)}\n\n"
+        f"Database map (semantic, PII-safe JSON):\n{context}\n\n"
+        f"Catalog views (for questions about the database itself):\n{catalog}\n\n"
         f"Business question:\n{question.strip()}\n\n"
         f"{_ASK_OUTPUT_CONTRACT}"
     )
@@ -184,6 +228,23 @@ def with_row_limit(sql: str, max_rows: int) -> str:
     """Wrap a validated SELECT so at most `max_rows` rows come back (Oracle ROWNUM, order-safe)."""
     n = max(1, int(max_rows))
     return f"SELECT * FROM (\n{sql}\n) WHERE ROWNUM <= {n}"
+
+
+def privilege_hint(sql: str, error: str) -> str | None:
+    """If a catalog query failed for lack of privilege, suggest the fix; else None.
+
+    A query over the whole-database DBA_* views needs SELECT_CATALOG_ROLE; without it Oracle
+    reports ORA-00942 / insufficient privileges. Surface that as actionable guidance.
+    """
+    e = error.lower()
+    denied = "ora-00942" in e or "insufficient priv" in e or "table or view does not exist" in e
+    if "dba_" in sql.lower() and denied:
+        return (
+            "That catalog question used the whole-database DBA_* views, which need a privileged "
+            "account (SELECT_CATALOG_ROLE). Use the 'full' access profile, or set "
+            "oracle.catalog_scope: scoped to answer from the ALL_* views instead."
+        )
+    return None
 
 
 # ------------------------------------------------------------------- helpers

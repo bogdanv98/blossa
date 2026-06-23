@@ -36,6 +36,7 @@ from ..nlquery import (
     UnsafeQueryError,
     build_ask_prompt,
     parse_ask_response,
+    privilege_hint,
     validate_read_only_select,
     with_row_limit,
 )
@@ -158,8 +159,9 @@ def create_app(
         if not question:
             raise HTTPException(status_code=400, detail="Ask a question.")
         prov = _ensure_provider()
+        prompt = build_ask_prompt(question, report, use_dba=settings.oracle.use_dba_catalog)
         try:
-            raw = prov.generate(ASK_SYSTEM_PROMPT, build_ask_prompt(question, report))
+            raw = prov.generate(ASK_SYSTEM_PROMPT, prompt)
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
         return parse_ask_response(raw).model_dump()
@@ -174,7 +176,11 @@ def create_app(
             with make_db() as db:
                 rows = db.query(with_row_limit(safe_sql, body.max_rows))
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
-            raise HTTPException(status_code=502, detail=f"Query failed: {exc}") from exc
+            detail = f"Query failed: {exc}"
+            hint = privilege_hint(safe_sql, str(exc))
+            if hint:
+                detail += f"  {hint}"
+            raise HTTPException(status_code=502, detail=detail) from exc
         columns = list(rows[0].keys()) if rows else []
         return {
             "columns": columns,

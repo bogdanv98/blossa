@@ -30,6 +30,26 @@ def test_heuristic_uses_existing_comment_with_high_confidence():
     assert "email" in email.meaning.lower()
 
 
+def test_heuristic_recognises_money_percent_address_and_title_columns():
+    from blossa.models import ColumnSummary, TableSummary
+
+    cols = ["SALARY", "MIN_SALARY", "COMMISSION_PCT", "JOB_TITLE", "STREET_ADDRESS", "CITY"]
+    summary = TableSummary(
+        name="JOBS",
+        columns=[ColumnSummary(name=c, type="VARCHAR2(40)", nullable=True) for c in cols],
+    )
+    sem = HeuristicProvider().analyze(summary)
+    by_col = {c.column: c for c in sem.columns}
+    # All of these used to fall through to the LOW "meaning unclear" bucket; now each matches a
+    # cross-domain naming pattern and earns at least medium confidence.
+    for name in cols:
+        assert by_col[name].confidence == ConfidenceLevel.MEDIUM, name
+    assert "monetary" in by_col["SALARY"].meaning
+    assert "percentage" in by_col["COMMISSION_PCT"].meaning
+    assert "address" in by_col["STREET_ADDRESS"].meaning
+    assert "title" in by_col["JOB_TITLE"].meaning
+
+
 def test_heuristic_flags_unknown_column_low_confidence():
     schema = build_demo_schema()
     relationships, _ = run_checks(schema)

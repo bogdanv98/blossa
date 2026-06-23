@@ -22,14 +22,20 @@ from ..models import (
 from .base import LLMProvider
 
 # token (matched against underscore-split column-name parts) -> (meaning, confidence)
+# Order matters: the first group with a matching token wins, so put the more specific groups
+# (e.g. the address fields, which include CITY) ahead of broader ones.
 _HIGH, _MED = ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM
 _TOKEN_MEANINGS: list[tuple[tuple[str, ...], str, ConfidenceLevel]] = [
     (("EMAIL", "MAIL"), "an email address", _HIGH),
-    (("PHONE", "TEL", "MOBILE"), "a phone number", _HIGH),
-    (("NAME", "FNAME", "LNAME"), "a name / label", _MED),
+    (("PHONE", "TEL", "MOBILE", "FAX"), "a phone number", _HIGH),
+    (("NAME", "FNAME", "LNAME", "TITLE"), "a name / label / title", _MED),
     (("DESCR", "DESC", "DESCRIPTION", "TXT", "TEXT", "NOTE"), "free-text description", _MED),
+    (("ADDRESS", "ADDR", "STREET", "CITY", "PROVINCE", "ZIP", "POSTAL", "POSTCODE"),
+     "a postal address field", _MED),
     (("QTY", "QUANTITY", "COUNT"), "a quantity / count", _MED),
-    (("PRICE", "AMT", "AMOUNT", "TOTAL", "COST", "SUM"), "a monetary amount", _MED),
+    (("PCT", "PERCENT", "PERCENTAGE", "RATIO", "RATE"), "a percentage / rate", _MED),
+    (("PRICE", "AMT", "AMOUNT", "TOTAL", "COST", "SUM", "SALARY", "PAY", "WAGE", "FEE",
+      "BALANCE", "CHARGE"), "a monetary amount", _MED),
     (("DATE", "DT", "TS", "TIME", "CREATED", "UPDATED", "MODIFIED"), "a date / timestamp", _MED),
     (("STATUS", "STAT", "STATE", "FLG", "FLAG"), "a status / flag", _MED),
     (("CD", "CODE", "CAT", "TYPE", "KIND"), "a classification code", _MED),

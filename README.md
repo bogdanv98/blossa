@@ -133,6 +133,7 @@ blossa scan --demo --llm-provider heuristic
 | `blossa scan` | Full pipeline against the configured Oracle schema → Markdown + JSON. |
 | `blossa scan --demo` | Run against the bundled offline fixture (no Oracle needed). |
 | `blossa ask "<question>"` | Ask a plain-language question; grounds on the map, shows the SQL, runs it read-only. |
+| `blossa serve` | Local web UI: browse the map + ask questions in a browser (needs `blossa[web]`). |
 | `blossa introspect` | Just dump the raw introspected schema as JSON (no checks, no LLM). |
 | `blossa check-llm` | Verify the configured LLM provider is reachable. |
 | `blossa ground-truth` | Capture real comments + FKs from a documented schema (for evaluation). |
@@ -158,6 +159,21 @@ model. Use `--dry-run` to see the SQL without executing it, and `--max-rows` to 
 `ask` needs a model provider (Ollama / OpenAI-compatible) — the offline heuristic can't translate
 language to SQL.
 
+## Web UI (browse + ask in a browser)
+
+For a non-technical analyst, the same thing is available as a small local web app:
+
+```bash
+pip install "blossa[web]"
+blossa serve --llm-provider ollama        # → http://127.0.0.1:8000
+```
+
+Two views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
+relationships, with search), and **Ask** runs the natural-language → SQL loop — you see the SQL
+(editable), the assumptions and confidence, then the results. The server binds to **localhost only**
+by default and keeps every boundary the CLI does: the model sees only the map, queries are validated
+read-only before running, and results stay in your browser (never sent to the model).
+
 ## See an example
 
 A full generated database map (from the bundled demo schema) is committed so you can see the output
@@ -176,9 +192,10 @@ schemas (HR / OE).
 
 In: read-only Oracle introspection (single, multi-, or all-schema), deterministic schema analysis
 incl. self / composite / cross-schema FK inference, PII-safe summaries, a local-LLM semantic pass,
-Markdown + JSON output, and a single-shot natural-language → read-only SQL command (`ask`).
+Markdown + JSON output, a single-shot natural-language → read-only SQL command (`ask`), and an
+optional local web UI (`serve`) to browse the map and ask questions.
 
-Out (for now): web UI, multi-turn conversational chat, any write access, non-Oracle engines,
+Out (for now): multi-turn conversational chat, any write access, non-Oracle engines,
 query-log/lineage ingestion, managed cloud, model fine-tuning.
 
 ## Develop & release

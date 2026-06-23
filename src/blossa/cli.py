@@ -261,6 +261,56 @@ def _print_rows(rows: list[dict], max_rows: int) -> None:
 
 
 @app.command()
+def serve(
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a config file."),
+    map_path: Path | None = typer.Option(
+        None, "--map", "-m", help="Scan JSON map to serve (default: <out>/<name>.json)."
+    ),
+    llm_provider: str | None = typer.Option(None, "--llm-provider"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address (localhost by default)."),
+    port: int = typer.Option(8000, "--port", help="Port to listen on."),
+) -> None:
+    r"""Serve a local web UI: browse the database map and ask questions in plain language.
+
+    Binds to localhost only by default. Needs the web extra: `pip install blossa\[web]`.
+    """
+    settings = load_settings(config)
+    if llm_provider:
+        settings.llm.provider = llm_provider
+
+    if map_path is None:
+        map_path = Path(settings.output.dir) / f"{settings.output.name}.json"
+    if not map_path.exists():
+        err.print(
+            f"[bold red]No database map at[/bold red] {map_path}. "
+            "Run [cyan]blossa scan[/cyan] first, or point to one with [cyan]--map[/cyan]."
+        )
+        raise typer.Exit(code=1)
+    try:
+        report = ScanReport.model_validate_json(map_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Could not read the map:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        import uvicorn
+
+        from .web.server import create_app
+    except ImportError:
+        err.print(
+            "[bold red]The web UI needs the 'web' extra.[/bold red] "
+            r"Install it with: [cyan]pip install blossa\[web][/cyan]"
+        )
+        raise typer.Exit(code=1) from None
+
+    console.print(
+        f"[bold green]Blossa[/bold green] serving [bold]{report.metadata.schema_name}[/bold] "
+        f"at [cyan]http://{host}:{port}[/cyan]  [dim](Ctrl+C to stop)[/dim]"
+    )
+    uvicorn.run(create_app(settings, report), host=host, port=port, log_level="warning")
+
+
+@app.command()
 def introspect(
     config: Path | None = typer.Option(None, "--config", "-c"),
     pretty: bool = typer.Option(True, "--pretty/--compact"),

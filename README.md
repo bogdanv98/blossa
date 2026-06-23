@@ -22,7 +22,7 @@ day instead of weeks). It is honest about its limits: it reconstructs what is *i
 Oracle (read-only)
    │  introspect data dictionary (ALL_TABLES, ALL_TAB_COLUMNS, ALL_CONSTRAINTS, …)
    ▼
-[ deterministic core ]  ── PKs/FKs, candidate FKs, orphans, type/naming issues, missing comments
+[ deterministic core ]  ── PKs/FKs, candidate FKs (self / composite / cross-schema), orphans, type/naming issues, missing comments
    │  build compact, PII-SAFE per-table summaries (aggregates + masked samples, never raw rows)
    ▼
 [ LLM semantic pass ]   ── runs ONLY over the structured summaries (local model by default)
@@ -33,6 +33,26 @@ Oracle (read-only)
 
 The deterministic core does the heavy lifting. The LLM is used sparingly, only over compact
 structured summaries — **never** over raw schema dumps or raw data.
+
+## Relationship & multi-schema inference
+
+Legacy schemas have usually lost their foreign-key declarations, so Blossa re-infers relationships
+from column names **plus actual data overlap**, not only from declared constraints:
+
+- **Exact-name candidates** — a column named like a key elsewhere (`ORDERS.CUST_ID → CUSTOMERS`),
+  confirmed by value overlap.
+- **Self-referential / role-named keys** — `EMPLOYEES.MANAGER_ID → EMPLOYEES.EMPLOYEE_ID`, matched
+  by name suffix + type and disambiguated by the data.
+- **Composite (multi-column) keys** — a child carrying every column of a multi-column key, by exact
+  name **or** by suffix / role name, confirmed by tuple overlap.
+- **Cross-schema keys** — when a scan spans several schemas, foreign keys that point *into another
+  schema* become discoverable (a single-schema scan never sees the parent).
+
+A scan can target one schema, a list, or `"*"` (every application schema, auto-discovered via
+`ALL_USERS.ORACLE_MAINTAINED`). With several schemas in scope the database map is grouped per owner
+and cross-schema links are labelled. Data-backed inference needs a live connection; offline, Blossa
+falls back to conservative name-only candidates. See **[samples/README.md](samples/README.md)** for
+worked, measured examples of each.
 
 ## Privacy / safety (hard constraints)
 
@@ -135,8 +155,9 @@ schemas (HR / OE).
 
 ## Scope (MVP)
 
-In: read-only Oracle introspection, deterministic schema analysis, PII-safe summaries, a local-LLM
-semantic pass, Markdown + JSON output.
+In: read-only Oracle introspection (single, multi-, or all-schema), deterministic schema analysis
+incl. self / composite / cross-schema FK inference, PII-safe summaries, a local-LLM semantic pass,
+Markdown + JSON output.
 
 Out (for now): web UI, chat interface, any write access, non-Oracle engines, query-log/lineage
 ingestion, managed cloud, model fine-tuning.

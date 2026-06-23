@@ -31,15 +31,27 @@ def _make_env() -> Environment:
     return env
 
 
+def _distinct_owners(report: ScanReport) -> list[str]:
+    """Distinct table owners in first-seen order (empty/None ignored)."""
+    owners: list[str] = []
+    for table in report.schema_info.tables:
+        if table.owner and table.owner not in owners:
+            owners.append(table.owner)
+    return owners
+
+
 def render_markdown(report: ScanReport) -> str:
     env = _make_env()
     template = env.get_template("database_map.md.j2")
+    owners = _distinct_owners(report)
     return template.render(
         report=report,
         meta=report.metadata,
         schema=report.schema_info,
         relationships=report.relationships,
         findings=report.findings,
+        owners=owners,
+        multi_schema=len(owners) > 1,
     )
 
 

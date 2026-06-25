@@ -77,6 +77,14 @@ ASK_SYSTEM_PROMPT = (
     "- Respond with STRICT JSON only — no prose, no markdown fences."
 )
 
+# ORACLE_MAINTAINED='N' is necessary but not sufficient to mean "application schema": a handful of
+# Oracle operational accounts (the PDB admin, OS-authenticated OPS$ logins) also carry that flag yet
+# hold no business data. This filter, applied to ALL_USERS/DBA_USERS, keeps only real app accounts.
+# Mirrors the intent of introspect._SYSTEM_SCHEMAS on the scanning side.
+_APP_OWNER_FILTER = (
+    "WHERE ORACLE_MAINTAINED='N' AND USERNAME NOT LIKE 'OPS$%' AND USERNAME NOT IN ('PDBADMIN')"
+)
+
 # Catalog/metadata views, by scope. "scoped" uses ALL_* — Oracle limits these to objects this
 # account may read, so answers are naturally confined to the granted schemas. "full" uses DBA_*
 # (the whole database; needs SELECT_CATALOG_ROLE).
@@ -87,15 +95,34 @@ CATALOG_REFERENCE_SCOPED = (
     "- ALL_TAB_COLUMNS(OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE): columns per table.\n"
     "- ALL_CONSTRAINTS(OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, "
     "R_CONSTRAINT_NAME): 'P'=primary key, 'R'=foreign key, 'U'=unique, 'C'=check.\n"
-    "- ALL_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects this account can see.\n"
+    "- ALL_VIEWS(OWNER, VIEW_NAME): views this account can read.\n"
+    "- ALL_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects of EVERY kind (TABLE, VIEW, INDEX, "
+    "SEQUENCE, PROCEDURE, TRIGGER, ...). To count one kind you MUST filter OBJECT_TYPE; without it "
+    "you count all kinds at once.\n"
     "- ALL_USERS(USERNAME, ORACLE_MAINTAINED): use ONLY to tell application owners "
     "(ORACLE_MAINTAINED='N') from Oracle-internal ones; never list schemas from it directly — it "
     "shows every user, not just what this account can read.\n"
     "- ALL_TAB_COMMENTS / ALL_COL_COMMENTS: documentation comments.\n"
     "These ALL_* views show only objects this account may read, so answers are limited to the "
-    "granted schemas. To list/count the application schemas in scope, take DISTINCT OWNER from "
-    "ALL_TABLES and keep only owners with ALL_USERS.ORACLE_MAINTAINED='N' (this drops SYS/SYSTEM/"
-    "XDB and other Oracle-internal owners that appear via public grants)."
+    "granted schemas — but public grants can still leak a few Oracle-internal objects, so ALWAYS "
+    "restrict to application owners: keep only owners with ALL_USERS.ORACLE_MAINTAINED='N' (this "
+    "drops SYS/SYSTEM/XDB and the like).\n"
+    "Distinguish the two countings carefully — copy these exact patterns:\n"
+    "  * How many/which TABLES (one row per table): "
+    "SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER IN "
+    "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N'). "
+    "Do NOT wrap this in DISTINCT OWNER — that would count schemas, not tables.\n"
+    "  * How many/which SCHEMAS (one row per owner): "
+    "SELECT COUNT(DISTINCT OWNER) FROM ALL_TABLES WHERE OWNER IN "
+    "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N').\n"
+    "  * How many/which VIEWS: SELECT COUNT(*) FROM ALL_VIEWS WHERE OWNER IN "
+    "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N'). For another object kind, count "
+    "ALL_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
+    "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
+    "application owners the same way, e.g. ALL_INDEXES, ALL_TRIGGERS, ALL_SEQUENCES, "
+    "ALL_SYNONYMS, ALL_PROCEDURES, ALL_SCHEDULER_JOBS, ALL_SCHEDULER_CHAINS (a 'chain' is a "
+    "DBMS_SCHEDULER job chain). If you do not recognise the object kind being asked about, set "
+    "\"sql\" to \"\" and ask the user to clarify rather than guessing."
 )
 CATALOG_REFERENCE_FULL = (
     "- DBA_USERS(USERNAME, ORACLE_MAINTAINED, ACCOUNT_STATUS, CREATED): every user/schema. "
@@ -105,8 +132,29 @@ CATALOG_REFERENCE_FULL = (
     "- DBA_TAB_COLUMNS(OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE): all columns.\n"
     "- DBA_CONSTRAINTS(OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, "
     "R_CONSTRAINT_NAME): 'P'=primary key, 'R'=foreign key, 'U'=unique, 'C'=check.\n"
-    "- DBA_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): all objects.\n"
-    "- DBA_TAB_COMMENTS / DBA_COL_COMMENTS: documentation comments."
+    "- DBA_VIEWS(OWNER, VIEW_NAME): all views.\n"
+    "- DBA_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects of EVERY kind (TABLE, VIEW, INDEX, "
+    "SEQUENCE, PROCEDURE, TRIGGER, ...). To count one kind you MUST filter OBJECT_TYPE; without it "
+    "you count all kinds at once.\n"
+    "- DBA_TAB_COMMENTS / DBA_COL_COMMENTS: documentation comments.\n"
+    "Distinguish the two countings carefully — copy these exact patterns:\n"
+    "Application accounts are ORACLE_MAINTAINED='N', but a few Oracle operational accounts also "
+    "carry that flag — exclude them everywhere with this filter:\n"
+    f"    {_APP_OWNER_FILTER}\n"
+    "  * How many/which TABLES (one row per table): "
+    "SELECT COUNT(*) FROM DBA_TABLES WHERE OWNER IN "
+    f"(SELECT USERNAME FROM DBA_USERS {_APP_OWNER_FILTER}). "
+    "Do NOT wrap this in DISTINCT OWNER — that would count schemas, not tables.\n"
+    "  * How many/which SCHEMAS (one row per owner, including app accounts with no tables yet): "
+    f"SELECT COUNT(*) FROM DBA_USERS {_APP_OWNER_FILTER}.\n"
+    "  * How many/which VIEWS: SELECT COUNT(*) FROM DBA_VIEWS WHERE OWNER IN "
+    f"(SELECT USERNAME FROM DBA_USERS {_APP_OWNER_FILTER}). For another object kind, count "
+    "DBA_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
+    "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
+    "application owners the same way, e.g. DBA_INDEXES, DBA_TRIGGERS, DBA_SEQUENCES, "
+    "DBA_SYNONYMS, DBA_PROCEDURES, DBA_SCHEDULER_JOBS, DBA_SCHEDULER_CHAINS (a 'chain' is a "
+    "DBMS_SCHEDULER job chain). If you do not recognise the object kind being asked about, set "
+    "\"sql\" to \"\" and ask the user to clarify rather than guessing."
 )
 
 

@@ -128,6 +128,46 @@ def test_prompt_catalog_views_follow_scope():
     assert "DBA_USERS" in full and "DBA_TABLES" in full
 
 
+def test_prompt_distinguishes_counting_tables_from_schemas():
+    # Regression: "how many tables" once produced COUNT(DISTINCT OWNER) (i.e. schemas). The catalog
+    # reference must spell out the table-count pattern and warn off DISTINCT OWNER, in both scopes.
+    report = _demo_report()
+    scoped = build_ask_prompt("how many tables?", report, use_dba=False)
+    full = build_ask_prompt("how many tables?", report, use_dba=True)
+    assert "COUNT(*) FROM ALL_TABLES" in scoped
+    assert "COUNT(*) FROM DBA_TABLES" in full
+    for prompt in (scoped, full):
+        assert "DISTINCT OWNER" in prompt  # the schema-count pattern is still offered
+        assert "count schemas, not tables" in prompt  # and explicitly contrasted
+
+
+def test_full_catalog_excludes_operational_accounts():
+    # Regression: ORACLE_MAINTAINED='N' alone leaks Oracle operational accounts (PDBADMIN, OS-auth
+    # OPS$ logins) into the "how many schemas" answer. They must be filtered out in full mode.
+    full = build_ask_prompt("how many schemas?", _demo_report(), use_dba=True)
+    assert "OPS$%" in full and "PDBADMIN" in full
+
+
+def test_prompt_counts_views_with_a_dedicated_view():
+    # Regression: "how many views" once counted ALL objects via DBA_OBJECTS (no OBJECT_TYPE filter).
+    # The reference must offer the dedicated views catalog and warn that *_OBJECTS spans every kind.
+    scoped = build_ask_prompt("how many views?", _demo_report(), use_dba=False)
+    full = build_ask_prompt("how many views?", _demo_report(), use_dba=True)
+    assert "ALL_VIEWS" in scoped and "DBA_VIEWS" in full
+    for prompt in (scoped, full):
+        assert "OBJECT_TYPE" in prompt  # filtering by kind is spelled out
+
+
+def test_prompt_covers_other_object_kinds_and_a_safety_net():
+    # Regression: "how many chains" returned "unclear". The reference should point at the dedicated
+    # dictionary views (e.g. scheduler chains) and tell the model to ask rather than guess.
+    scoped = build_ask_prompt("how many chains?", _demo_report(), use_dba=False)
+    full = build_ask_prompt("how many chains?", _demo_report(), use_dba=True)
+    assert "ALL_SCHEDULER_CHAINS" in scoped and "DBA_SCHEDULER_CHAINS" in full
+    for prompt in (scoped, full):
+        assert "ask the user to clarify rather than guessing" in prompt
+
+
 # --------------------------------------------------------- catalog privilege hint
 
 

@@ -60,9 +60,14 @@ ASK_SYSTEM_PROMPT = (
     "You are a careful data-analyst assistant. You translate a business user's natural-language "
     "question into exactly ONE read-only Oracle SQL query.\n\n"
     "You are given a semantic map of the application schema(s) — tables, columns with inferred "
-    "business meaning, and relationships — and a short 'Catalog views' list of Oracle "
-    "data-dictionary views for questions about the database itself.\n\n"
+    "business meaning, relationships, and a 'programs' list (stored procedures/functions/packages/"
+    "triggers/views, each with a plain-language 'does' summary) — and a short 'Catalog views' list "
+    "of Oracle data-dictionary views for questions about the database itself.\n\n"
     "Rules:\n"
+    "- If the question asks what a procedure/function/package/trigger/view DOES, or about the "
+    "application's logic, ANSWER IT IN PLAIN LANGUAGE from the 'programs' summaries in the map: "
+    "put the answer in \"explanation\" and set \"sql\" to \"\" (there is no query to run). Name "
+    "the units you describe. If the asked-about unit is not in the map, say so.\n"
     "- Produce exactly ONE statement: a SELECT (a leading WITH ... SELECT is fine). NEVER write "
     "INSERT, UPDATE, DELETE, MERGE or any DDL.\n"
     "- For questions about the DATA, use ONLY tables and columns from the map. Qualify columns "
@@ -226,7 +231,22 @@ def build_schema_context(report: ScanReport) -> dict:
             f"{src}({', '.join(r.from_columns)}) -> {dst}({', '.join(r.to_columns)}) [{kind}]"
         )
 
-    return {"schema": report.schema_info.name, "tables": tables, "relationships": relationships}
+    programs = [
+        {
+            "name": _qualified(p.name, p.owner, multi),
+            "kind": p.kind.value,
+            "does": p.summary,
+            "tables_used": p.tables_used,
+        }
+        for p in report.program_semantics
+    ]
+
+    return {
+        "schema": report.schema_info.name,
+        "tables": tables,
+        "relationships": relationships,
+        "programs": programs,
+    }
 
 
 def build_ask_prompt(question: str, report: ScanReport, *, use_dba: bool = False) -> str:

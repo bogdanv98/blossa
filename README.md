@@ -160,8 +160,16 @@ model. Use `--dry-run` to see the SQL without executing it, and `--max-rows` to 
 row counts, columns, constraints) from Oracle's data dictionary — see _Access_ below for how the
 `scoped` vs `full` profile decides whether that covers just your schemas or the whole database.
 
+It can also explain the **application logic**: ask _"what does the SECURE_DML procedure do?"_ and
+Blossa answers in plain language (no SQL to run). This works because the scan reads the **source**
+of stored procedures, functions, packages, triggers and views, and has the model summarise what
+each one does and which tables it touches — captured in the map (and shown in the web UI's **Logic**
+tab). Source code is DDL/metadata, not row data, so it stays within the same privacy boundary as
+the table structure; raw rows are still never sent to the model. (Reading another schema's PL/SQL
+needs the `full` profile, whose `SELECT_CATALOG_ROLE` exposes the source views.)
+
 `ask` needs a model provider (Ollama / OpenAI-compatible) — the offline heuristic can't translate
-language to SQL.
+language to SQL or read code.
 
 ## Access: a least-privilege read-only account
 
@@ -187,9 +195,10 @@ pip install "blossa[web]"
 blossa serve --llm-provider ollama        # → http://127.0.0.1:8000
 ```
 
-Two views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
-relationships, with search), and **Ask** runs the natural-language → SQL loop — you see the SQL
-(editable), the assumptions and confidence, then the results. The server binds to **localhost only**
+Three views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
+relationships, with search), **Logic** lists what each stored procedure/function/package/trigger/
+view does (plus the tables it touches), and **Ask** runs the natural-language → SQL loop — you see
+the SQL (editable), the assumptions and confidence, then the results. The server binds to **localhost only**
 by default and keeps every boundary the CLI does: the model sees only the map, queries are validated
 read-only before running, and results stay in your browser (never sent to the model).
 

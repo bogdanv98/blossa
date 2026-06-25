@@ -93,3 +93,16 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .table-detail .purpose { color: var(--muted); margin: 4px 0 14px; }
 .rels { margin: 14px 0 0; padding-left: 18px; font-size: 14px; }
 .pill { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--line); color: var(--ink); }
+
+/* Program logic --------------------------------------------------------- */
+#logic-search {
+  width: 100%; padding: 9px 12px; border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 6px; background: var(--panel);
+}
+.program-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 12px;
+}
+.program-card p { margin: 8px 0 0; font-size: 14px; }
+.program-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.program-head code { font-size: 14px; font-weight: 600; }

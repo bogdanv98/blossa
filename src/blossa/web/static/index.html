@@ -13,6 +13,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="ask">Ask</button>
       <button class="tab" data-tab="schema">Schema</button>
+      <button class="tab" data-tab="logic">Logic</button>
     </nav>
   </header>
 
@@ -55,6 +56,17 @@
         <p class="muted">Select a table to see its columns, meanings and relationships.</p>
       </section>
     </div>
+  </main>
+
+  <!-- LOGIC ------------------------------------------------------------------>
+  <main id="tab-logic" class="tab-panel">
+    <input id="logic-search" type="text" placeholder="Search procedures, functions, views…"
+           autocomplete="off" />
+    <p class="muted small">
+      What the stored procedures, functions, packages, triggers and views do — read from their
+      source by the model. Inferred; verify before relying on it.
+    </p>
+    <div id="programs"></div>
   </main>
 
   <script src="/static/app.js"></script>

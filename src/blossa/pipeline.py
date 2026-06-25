@@ -24,12 +24,14 @@ from .llm import get_provider
 from .llm.base import LLMProvider
 from .models import (
     Finding,
+    ProgramSemantics,
     Relationship,
     ScanMetadata,
     ScanReport,
     SchemaInfo,
     TableSemantics,
 )
+from .program import run_program_pass
 from .semantic import run_semantic_pass
 from .summary import build_summaries
 
@@ -56,7 +58,7 @@ def introspect_and_profile(
     owners = _owners_to_scan(db, settings)
     label = owners[0] if len(owners) == 1 else f"{len(owners)} schemas ({', '.join(owners)})"
     status(f"Introspecting {label} ...")
-    schema = introspect_schemas(db, owners)
+    schema = introspect_schemas(db, owners, use_dba=settings.oracle.use_dba_catalog)
 
     if settings.scan.max_tables and len(schema.tables) > settings.scan.max_tables:
         schema.tables = schema.tables[: settings.scan.max_tables]
@@ -96,6 +98,24 @@ def semantic(
     return run_semantic_pass(provider, summaries, progress=progress)
 
 
+def program_semantics(
+    schema: SchemaInfo,
+    provider: LLMProvider,
+    status: StatusFn = _noop,
+) -> list[ProgramSemantics]:
+    """Explain stored program units with the LLM. Needs a model provider; the offline heuristic
+    can't read code, so we skip it (the units are still captured and shown, just unexplained)."""
+    units = schema.program_units
+    if not units or provider.name == "heuristic":
+        return []
+    known_tables = [t.name for t in schema.tables]
+
+    def progress(unit_name: str, i: int, total: int) -> None:
+        status(f"Explaining program logic [{i}/{total}]: {unit_name} ...")
+
+    return run_program_pass(provider, units, known_tables, progress=progress)
+
+
 def assemble_report(
     schema: SchemaInfo,
     relationships: list[Relationship],
@@ -103,6 +123,7 @@ def assemble_report(
     semantics: list[TableSemantics],
     provider: LLMProvider,
     profiling_enabled: bool,
+    programs: list[ProgramSemantics] | None = None,
 ) -> ScanReport:
     metadata = ScanMetadata(
         blossa_version=__version__,
@@ -119,6 +140,7 @@ def assemble_report(
         relationships=relationships,
         findings=findings,
         semantics=semantics,
+        program_semantics=programs or [],
     )
 
 
@@ -134,6 +156,7 @@ def run_scan_over_schema(
     status("Running deterministic checks ...")
     relationships, findings = analyze(schema, settings, db, owner)
     semantics = semantic(schema, relationships, provider, status)
+    programs = program_semantics(schema, provider, status)
     return assemble_report(
         schema,
         relationships,
@@ -141,6 +164,7 @@ def run_scan_over_schema(
         semantics,
         provider,
         profiling_enabled=not settings.scan.skip_profiling,
+        programs=programs,
     )
 
 

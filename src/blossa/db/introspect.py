@@ -12,6 +12,8 @@ from ..models import (
     ConstraintInfo,
     ConstraintType,
     IndexInfo,
+    ProgramKind,
+    ProgramUnit,
     SchemaInfo,
     TableInfo,
 )
@@ -77,9 +79,50 @@ _IND_COLUMNS_SQL = """
      ORDER BY INDEX_NAME, COLUMN_POSITION
 """
 
+# Program-unit source views. ALL_SOURCE is filtered by EXECUTE privilege, so a least-privilege
+# reader cannot see another schema's PL/SQL through it; with the full profile (SELECT_CATALOG_ROLE)
+# the DBA_* views show every unit's source. The column lists are identical across ALL_/DBA_, so we
+# just swap the view name based on the catalog scope. {view} is an internal constant, never input.
 
-def introspect_schema(db: QueryExecutor, owner: str) -> SchemaInfo:
-    """Read all tables/columns/constraints/indexes for `owner` into a SchemaInfo."""
+# Stored PL/SQL: standalone procedures/functions and packages (spec + body). Ordered so the
+# lines of each unit arrive in order; a package's spec ('PACKAGE') sorts before its body.
+_SOURCE_SQL = """
+    SELECT NAME, TYPE, LINE, TEXT
+      FROM {view}
+     WHERE OWNER = :owner
+       AND TYPE IN ('PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY')
+     ORDER BY NAME, TYPE, LINE
+"""
+
+_TRIGGERS_SQL = """
+    SELECT TRIGGER_NAME, DESCRIPTION, TRIGGERING_EVENT, TABLE_NAME, TRIGGER_BODY
+      FROM {view}
+     WHERE OWNER = :owner
+     ORDER BY TRIGGER_NAME
+"""
+
+_VIEWS_SQL = """
+    SELECT VIEW_NAME, TEXT
+      FROM {view}
+     WHERE OWNER = :owner
+     ORDER BY VIEW_NAME
+"""
+
+# ALL_SOURCE.TYPE -> the program kind we expose (spec and body both fold into one PACKAGE unit).
+_KIND_BY_SOURCE_TYPE = {
+    "PROCEDURE": ProgramKind.PROCEDURE,
+    "FUNCTION": ProgramKind.FUNCTION,
+    "PACKAGE": ProgramKind.PACKAGE,
+    "PACKAGE BODY": ProgramKind.PACKAGE,
+}
+
+
+def introspect_schema(db: QueryExecutor, owner: str, use_dba: bool = False) -> SchemaInfo:
+    """Read all tables/columns/constraints/indexes for `owner` into a SchemaInfo.
+
+    `use_dba` selects the DBA_* program-source views (needs the full catalog profile) so a reader
+    can capture other schemas' PL/SQL; otherwise the EXECUTE-filtered ALL_* views are used.
+    """
     binds = {"owner": owner}
 
     tables = {r["TABLE_NAME"]: r for r in db.query(_TABLES_SQL, binds)}
@@ -106,6 +149,7 @@ def introspect_schema(db: QueryExecutor, owner: str) -> SchemaInfo:
                 indexes=indexes_by_table.get(table_name, []),
             )
         )
+    schema.program_units = _build_program_units(db, owner, binds, use_dba)
     return schema
 
 
@@ -148,13 +192,15 @@ def list_non_system_schemas(db: QueryExecutor) -> list[str]:
         return [r["OWNER"] for r in db.query(sql)]
 
 
-def introspect_schemas(db: QueryExecutor, owners: list[str]) -> SchemaInfo:
+def introspect_schemas(db: QueryExecutor, owners: list[str], use_dba: bool = False) -> SchemaInfo:
     """Introspect several owners and merge them into one SchemaInfo (tables tagged with owner)."""
     if len(owners) == 1:
-        return introspect_schema(db, owners[0])
+        return introspect_schema(db, owners[0], use_dba)
     merged = SchemaInfo(name="+".join(owners))
     for owner in owners:
-        merged.tables.extend(introspect_schema(db, owner).tables)
+        one = introspect_schema(db, owner, use_dba)
+        merged.tables.extend(one.tables)
+        merged.program_units.extend(one.program_units)
     return merged
 
 
@@ -282,6 +328,84 @@ def _build_indexes(db: QueryExecutor, binds: dict[str, Any]) -> dict[str, list[I
             )
         )
     return out
+
+
+def _build_program_units(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool = False
+) -> list[ProgramUnit]:
+    """Capture stored program units (procedures/functions/packages/triggers) and views + source.
+
+    Source is PL/SQL / a view's defining SELECT — DDL, not row data. Each dictionary view is read
+    independently and a read failure (e.g. no privilege on the source view) degrades to skipping
+    that kind rather than aborting the whole scan. `use_dba` picks DBA_* over ALL_* (see above).
+    """
+    return [
+        *_plsql_units(db, owner, binds, use_dba),
+        *_trigger_units(db, owner, binds, use_dba),
+        *_view_units(db, owner, binds, use_dba),
+    ]
+
+
+def _plsql_units(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
+) -> list[ProgramUnit]:
+    view = "DBA_SOURCE" if use_dba else "ALL_SOURCE"
+    try:
+        rows = db.query(_SOURCE_SQL.format(view=view), binds)  # noqa: S608 - view is a constant
+    except Exception:  # noqa: BLE001 - no access to the source view: skip PL/SQL, keep scanning
+        return []
+    # Accumulate lines per unit name, preserving the (TYPE, LINE) order from the query.
+    by_name: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        name = r["NAME"]
+        kind = _KIND_BY_SOURCE_TYPE.get(r["TYPE"], ProgramKind.PROCEDURE)
+        entry = by_name.setdefault(name, {"kind": kind, "parts": []})
+        entry["parts"].append(_to_text(r.get("TEXT")) or "")
+    return [
+        ProgramUnit(name=name, owner=owner, kind=e["kind"], source="".join(e["parts"]).strip())
+        for name, e in by_name.items()
+    ]
+
+
+def _trigger_units(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
+) -> list[ProgramUnit]:
+    view = "DBA_TRIGGERS" if use_dba else "ALL_TRIGGERS"
+    try:
+        rows = db.query(_TRIGGERS_SQL.format(view=view), binds)  # noqa: S608 - view is a constant
+    except Exception:  # noqa: BLE001 - no access to the triggers view: skip triggers, keep scanning
+        return []
+    units = []
+    for r in rows:
+        header = (_to_text(r.get("DESCRIPTION")) or "").strip()
+        event = f"-- {r.get('TRIGGERING_EVENT')} ON {r.get('TABLE_NAME')}"
+        body = (_to_text(r.get("TRIGGER_BODY")) or "").strip()
+        source = "\n".join(part for part in (event, header, body) if part)
+        units.append(
+            ProgramUnit(
+                name=r["TRIGGER_NAME"], owner=owner, kind=ProgramKind.TRIGGER, source=source
+            )
+        )
+    return units
+
+
+def _view_units(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
+) -> list[ProgramUnit]:
+    view = "DBA_VIEWS" if use_dba else "ALL_VIEWS"
+    try:
+        rows = db.query(_VIEWS_SQL.format(view=view), binds)  # noqa: S608 - view is a constant
+    except Exception:  # noqa: BLE001 - no access to the views view: skip views, keep scanning
+        return []
+    return [
+        ProgramUnit(
+            name=r["VIEW_NAME"],
+            owner=owner,
+            kind=ProgramKind.VIEW,
+            source=(_to_text(r.get("TEXT")) or "").strip(),
+        )
+        for r in rows
+    ]
 
 
 # --------------------------------------------------------------------- helpers

@@ -79,6 +79,19 @@ relying on them. No raw row values were sent to the language model — only PII-
 _No findings._
 {% endif %}
 
+{% if report.program_semantics %}
+## Program logic
+
+> What the stored procedures, functions, packages, triggers and views do — read from their source
+> by the language model. Inferred; verify before relying on it.
+
+| Unit | Kind | What it does | Tables used | Conf. |
+| --- | --- | --- | --- | --- |
+{% for p in report.program_semantics %}
+| `{{ (p.owner ~ "." if multi_schema and p.owner else "") }}{{ p.name }}` | {{ p.kind.value }} | {{ p.summary | replace("|", "\\|") | replace("\n", " ") }} | {{ p.tables_used | join(", ") | replace("|", "\\|") }} | {{ p.confidence | confidence }} |
+{% endfor %}
+
+{% endif %}
 ---
 
 ## Table details

@@ -34,6 +34,7 @@ async function loadMap() {
     : `${MAP.schema_name} · ${MAP.table_count} tables · ${MAP.provider}`;
   $("#schema-name").textContent = label;
   renderTableList(MAP.tables);
+  renderPrograms(MAP.programs || []);
 }
 
 // --- ask --------------------------------------------------------------------
@@ -53,7 +54,9 @@ $("#ask-form").addEventListener("submit", async (e) => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Ask failed.");
     if (!data.sql || !data.sql.trim()) {
-      setStatus("#ask-status", data.explanation || "I couldn't turn that into a query.", true);
+      // No SQL: a plain-language answer (e.g. "what does this procedure do") or a genuine
+      // "can't answer". The model's explanation is the response — show it, not as an error.
+      setStatus("#ask-status", data.explanation || "I couldn't turn that into a query.");
       return;
     }
     showAnswer(data);
@@ -203,6 +206,39 @@ function appendRels(box, title, items) {
   items.forEach((r) => ul.append(el("li", { text: r })));
   box.append(ul);
 }
+
+// --- program logic ----------------------------------------------------------
+function renderPrograms(programs) {
+  const box = $("#programs");
+  box.replaceChildren();
+  if (!programs.length) {
+    box.append(el("p", { class: "muted", text: "No stored program units were found (or the scan ran without a model to read their logic)." }));
+    return;
+  }
+  programs.forEach((p) => {
+    const card = el("div", { class: "program-card" });
+    const head = el("div", { class: "program-head" },
+      el("code", { text: p.name }),
+      el("span", { class: "pill", text: p.kind }),
+      p.confidence ? el("span", { class: "badge " + p.confidence, text: p.confidence }) : el("span", {})
+    );
+    card.append(head);
+    card.append(el("p", { text: p.summary || "—" }));
+    if (p.tables_used && p.tables_used.length)
+      card.append(el("p", { class: "muted small", text: "Tables: " + p.tables_used.join(", ") }));
+    box.append(card);
+  });
+}
+
+$("#logic-search").addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase();
+  const all = MAP.programs || [];
+  renderPrograms(all.filter((p) =>
+    p.name.toLowerCase().includes(q) ||
+    (p.summary || "").toLowerCase().includes(q) ||
+    (p.tables_used || []).join(" ").toLowerCase().includes(q)
+  ));
+});
 
 // --- helpers ----------------------------------------------------------------
 function setStatus(sel, msg, isError = false) {

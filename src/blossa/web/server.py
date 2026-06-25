@@ -109,12 +109,25 @@ def build_map_view(report: ScanReport) -> dict:
             }
         )
 
+    programs = [
+        {
+            "name": q(p.name, p.owner),
+            "owner": p.owner,
+            "kind": p.kind.value,
+            "summary": p.summary,
+            "tables_used": p.tables_used,
+            "confidence": p.confidence.value,
+        }
+        for p in report.program_semantics
+    ]
+
     return {
         "schema_name": report.metadata.schema_name,
         "multi_schema": multi,
         "table_count": report.metadata.table_count,
         "provider": report.metadata.llm_provider,
         "tables": tables,
+        "programs": programs,
     }
 
 

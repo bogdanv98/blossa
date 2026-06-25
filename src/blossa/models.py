@@ -47,6 +47,16 @@ class KeyRole(StrEnum):
     UNIQUE = "unique"
 
 
+class ProgramKind(StrEnum):
+    """Kinds of stored program unit Blossa captures and explains."""
+
+    PROCEDURE = "PROCEDURE"
+    FUNCTION = "FUNCTION"
+    PACKAGE = "PACKAGE"
+    TRIGGER = "TRIGGER"
+    VIEW = "VIEW"
+
+
 class Severity(StrEnum):
     INFO = "info"
     WARNING = "warning"
@@ -158,11 +168,25 @@ class TableInfo(BaseModel):
         return [c for c in self.constraints if c.type == ConstraintType.FOREIGN_KEY]
 
 
+class ProgramUnit(BaseModel):
+    """A stored program unit (procedure/function/package/trigger) or view, with its source.
+
+    The source is PL/SQL or a view's defining SELECT — i.e. DDL/metadata, NOT row data. It is
+    therefore safe to send to the LLM under the same boundary that allows table/column structure.
+    """
+
+    name: str
+    owner: str | None = None
+    kind: ProgramKind
+    source: str = ""
+
+
 class SchemaInfo(BaseModel):
     """The whole introspected schema."""
 
     name: str
     tables: list[TableInfo] = Field(default_factory=list)
+    program_units: list[ProgramUnit] = Field(default_factory=list)
 
     def table(self, name: str) -> TableInfo | None:
         return next((t for t in self.tables if t.name == name), None)
@@ -249,6 +273,18 @@ class TableSemantics(BaseModel):
     columns: list[ColumnSemantics] = Field(default_factory=list)
 
 
+class ProgramSemantics(BaseModel):
+    """The LLM's plain-language read of one program unit: what it does and the logic behind it."""
+
+    name: str
+    owner: str | None = None
+    kind: ProgramKind
+    summary: str
+    tables_used: list[str] = Field(default_factory=list)
+    confidence: ConfidenceLevel
+    evidence: list[str] = Field(default_factory=list)
+
+
 # -------------------------------------------------------------- final report
 
 
@@ -270,6 +306,7 @@ class ScanReport(BaseModel):
     relationships: list[Relationship] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
     semantics: list[TableSemantics] = Field(default_factory=list)
+    program_semantics: list[ProgramSemantics] = Field(default_factory=list)
 
     def semantics_for(self, table: str) -> TableSemantics | None:
         return next((s for s in self.semantics if s.table == table), None)

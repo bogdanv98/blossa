@@ -211,9 +211,13 @@ def ask(
     result = parse_ask_response(raw)
 
     if not result.answerable:
-        err.print("[yellow]I couldn't turn that into a query for this schema.[/yellow]")
+        # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from
+        # the map's program summaries, or a genuine "can't answer". Either way the model's text is
+        # the response — show it.
         if result.explanation:
             console.print(result.explanation)
+            return
+        err.print("[yellow]I couldn't turn that into a query for this schema.[/yellow]")
         raise typer.Exit(code=2)
 
     console.print()

@@ -132,7 +132,8 @@ blossa scan --demo --llm-provider heuristic
 | `blossa doctor` | Check every prerequisite (Python, driver, config, Oracle, LLM, output) and report fixes. |
 | `blossa scan` | Full pipeline against the configured Oracle schema → Markdown + JSON. |
 | `blossa scan --demo` | Run against the bundled offline fixture (no Oracle needed). |
-| `blossa ask "<question>"` | Ask a plain-language question; grounds on the map, shows the SQL, runs it read-only. |
+| `blossa ask "<question>"` | Ask a plain-language question; grounds on the map, shows the SQL, runs it read-only. Omit the question for an interactive session where follow-ups refine the last query. |
+| `blossa logs [TABLE]` | Analyse an application log/error/audit table: severity/source breakdowns + recent entries; `--explain` clusters root causes (local model only). |
 | `blossa serve` | Local web UI: browse the map + ask questions in a browser (needs `blossa[web]`). |
 | `blossa introspect` | Just dump the raw introspected schema as JSON (no checks, no LLM). |
 | `blossa check-llm` | Verify the configured LLM provider is reachable. |
@@ -155,6 +156,13 @@ the assumptions it made and a confidence level, so the answer can be verified ra
 blindly. The query is validated to be a single read-only SELECT before it runs (and the connection
 is a READ ONLY transaction regardless). Results are shown to you only — they are not sent back to the
 model. Use `--dry-run` to see the SQL without executing it, and `--max-rows` to cap the output.
+
+**Refine across turns.** Run `blossa ask` with no question to start an interactive session and
+**follow up** to refine the last query — _"now break it down by year"_, _"only the top 5"_, _"add
+their email"_. Each follow-up sends the model the earlier questions and the SQL it produced (so it
+can build on them) but **never any results**, so the no-raw-rows boundary holds across the whole
+conversation. Type `reset` to start a fresh thread, blank/`exit` to quit. The same refine loop is in
+the web UI's **Ask** tab (with a _New thread_ button).
 
 `ask` also answers questions about the **database itself** (how many schemas, which tables exist,
 row counts, columns, constraints) from Oracle's data dictionary — see _Access_ below for how the
@@ -186,6 +194,29 @@ and run** (Blossa never creates the account or grants itself). Two profiles:
 The `oracle.catalog_scope: scoped | full` config flag (default `scoped`) tells `ask`/`serve` which
 data-dictionary views to use. The connection always runs in a READ ONLY transaction regardless.
 
+## Make sense of error / log tables
+
+Most applications keep their own tables to record what happened to the business data — error logs,
+change-audit trails, batch-job logs. Blossa recognises them **deterministically** (no LLM): from the
+table name and the column shape it tags each as an `error` / `audit` / `job` / `event` log and labels
+the role every column plays — _when_ (event time), _severity_, _message_, _source_ (module/job),
+_actor_, _business reference_ (an FK back to the entity involved), _code_. These show up in the map
+(a dedicated **Application logs** section / **Logs** tab) and make `ask` log-aware: _"what are the
+most common errors this week?"_ or _"which module fails most?"_ produce the right grouped, time-bounded
+SQL.
+
+```bash
+blossa logs                       # breakdowns (by severity, by source) + most recent errors
+blossa logs ERROR_LOG --explain   # + cluster the recent errors into root causes
+```
+
+The breakdowns and recent entries are plain read-only SQL — **results are shown to you only**.
+`--explain` goes one step further and reads the actual error text to cluster it into a few plain-language
+root causes with suggested actions. Because that means sending row text to the model, Blossa allows it
+**only with a LOCAL model** (e.g. Ollama), where nothing leaves your machine; with a remote provider it
+refuses. The message is also PII-redacted (emails, long card/account numbers) before it is sent, as
+defence-in-depth. In the web UI the same thing is an **Explain recent errors** button on each log card.
+
 ## Web UI (browse + ask in a browser)
 
 For a non-technical analyst, the same thing is available as a small local web app:
@@ -195,12 +226,14 @@ pip install "blossa[web]"
 blossa serve --llm-provider ollama        # → http://127.0.0.1:8000
 ```
 
-Three views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
+Four views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
 relationships, with search), **Logic** lists what each stored procedure/function/package/trigger/
-view does (plus the tables it touches), and **Ask** runs the natural-language → SQL loop — you see
-the SQL (editable), the assumptions and confidence, then the results. The server binds to **localhost only**
-by default and keeps every boundary the CLI does: the model sees only the map, queries are validated
-read-only before running, and results stay in your browser (never sent to the model).
+view does (plus the tables it touches), **Logs** shows the recognised application log/error/audit
+tables with each column's role (and an _Explain recent errors_ button), and **Ask** runs the
+natural-language → SQL loop — you see the SQL (editable), the assumptions and confidence, then the
+results. The server binds to **localhost only** by default and keeps every boundary the CLI does:
+the model sees only the map (plus, for an explicit log explanation, PII-redacted error text on a
+local model), queries are validated read-only before running, and results stay in your browser.
 
 ## See an example
 
@@ -220,11 +253,12 @@ schemas (HR / OE).
 
 In: read-only Oracle introspection (single, multi-, or all-schema), deterministic schema analysis
 incl. self / composite / cross-schema FK inference, PII-safe summaries, a local-LLM semantic pass,
-Markdown + JSON output, a single-shot natural-language → read-only SQL command (`ask`), and an
+Markdown + JSON output, application log/error/audit-table detection (with local-only root-cause
+explanation), a natural-language → read-only SQL command (`ask`) with multi-turn refinement, and an
 optional local web UI (`serve`) to browse the map and ask questions.
 
-Out (for now): multi-turn conversational chat, any write access, non-Oracle engines,
-query-log/lineage ingestion, managed cloud, model fine-tuning.
+Out (for now): any write access, non-Oracle engines, query-log/lineage ingestion, managed cloud,
+model fine-tuning.
 
 ## Develop & release
 

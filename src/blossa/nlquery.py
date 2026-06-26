@@ -13,8 +13,10 @@ The flow, and the trust/safety boundaries that make it usable for a non-technica
     and the connection runs in a READ ONLY transaction regardless, so DML/DDL cannot execute.
   * The SQL is always shown to the user, with the model's assumptions and confidence, so the
     answer can be verified rather than trusted blindly.
-  * Query results are returned to the user only; in this phase they are NOT fed back to the LLM,
-    so no real data leaves for a model to read.
+  * Query results are returned to the user only; they are NOT fed back to the LLM, so no real
+    data leaves for a model to read. This holds even for multi-turn refinement: a follow-up
+    ("now break it down by year") carries back only the prior questions and the SQL the model
+    itself produced — both structure/metadata, never a single row of data.
 
 This module holds the pure, testable pieces (context, prompt, parsing, validation, row-limit);
 the CLI wires them to a live provider + database.
@@ -27,7 +29,8 @@ import re
 
 from pydantic import BaseModel, Field
 
-from .models import ConfidenceLevel, ScanReport
+from .logsense import ERROR_SEVERITIES
+from .models import ConfidenceLevel, LogRole, ScanReport
 
 # Keywords that must never appear in a query we are about to run. The READ ONLY transaction on the
 # connection is the real backstop; this is defence-in-depth and gives a clearer error message.
@@ -56,23 +59,63 @@ class AskResult(BaseModel):
         return bool(self.sql.strip())
 
 
+class Turn(BaseModel):
+    """One earlier exchange in a multi-turn `ask` conversation.
+
+    Holds the user's question and the SQL the model produced for it (empty when that turn was
+    answered in plain language, e.g. "what does this procedure do"). Deliberately carries NO query
+    results — only the question text and the model's own SQL ever return to the model on a
+    follow-up, so the "no raw rows to the LLM" boundary holds across turns.
+    """
+
+    question: str
+    sql: str = ""
+
+
+# Keep a follow-up prompt bounded: only the most recent turns are replayed to the model.
+_MAX_HISTORY = 8
+
+
 ASK_SYSTEM_PROMPT = (
     "You are a careful data-analyst assistant. You translate a business user's natural-language "
     "question into exactly ONE read-only Oracle SQL query.\n\n"
     "You are given a semantic map of the application schema(s) — tables, columns with inferred "
-    "business meaning, relationships, and a 'programs' list (stored procedures/functions/packages/"
-    "triggers/views, each with a plain-language 'does' summary) — and a short 'Catalog views' list "
-    "of Oracle data-dictionary views for questions about the database itself.\n\n"
+    "business meaning, relationships, a 'programs' list (stored procedures/functions/packages/"
+    "triggers/views, each with a plain-language 'does' summary), and a 'log_tables' list "
+    "(application log/error/audit tables, each column tagged with a role) — and a short 'Catalog "
+    "views' list of Oracle data-dictionary views for questions about the database itself.\n\n"
     "Rules:\n"
     "- If the question asks what a procedure/function/package/trigger/view DOES, or about the "
     "application's logic, ANSWER IT IN PLAIN LANGUAGE from the 'programs' summaries in the map: "
     "put the answer in \"explanation\" and set \"sql\" to \"\" (there is no query to run). Name "
     "the units you describe. If the asked-about unit is not in the map, say so.\n"
+    "- The question may be a FOLLOW-UP that refines the previous query in the conversation (e.g. "
+    "'now break it down by year', 'only the top 5', 'add their email', 'exclude interns'). When it "
+    "clearly builds on the last query, START FROM the most recent SQL shown in the conversation "
+    "and adjust it — keep the earlier filters, joins and columns unless the user changed them. "
+    "When the question is unrelated to the conversation, ignore the prior SQL and answer fresh.\n"
     "- Produce exactly ONE statement: a SELECT (a leading WITH ... SELECT is fine). NEVER write "
     "INSERT, UPDATE, DELETE, MERGE or any DDL.\n"
     "- For questions about the DATA, use ONLY tables and columns from the map. Qualify columns "
     "when ambiguous, use the listed relationships for joins, and reference tables by the names "
     "shown in the map (owner-qualified when the name contains a dot).\n"
+    "- For questions about ERRORS, FAILURES, what went wrong, change-audit (who changed what) or "
+    "job runs, use the 'log_tables'. Read each column's role: filter/sort by the 'event_time' "
+    "column for recent entries or a time window; GROUP BY the 'severity' or 'source' column for "
+    "'most common' / 'which module fails most'; show the 'message' column when the user wants to "
+    "see the actual errors; and JOIN the 'business_ref' column back to its business table when "
+    "asked which orders/customers/etc. were affected. Prefer the log table whose 'kind' matches "
+    "(error / audit / job / event).\n"
+    "- CRITICAL for error questions: a log table holds entries of EVERY severity, not just "
+    "failures, EVEN when the table is named ERROR_LOG / *_LOG — its name does NOT mean every row "
+    "is an error. So when the user asks for ERRORS or FAILURES (and not 'all entries' / "
+    "'everything logged'), selecting from the table is NOT enough: you MUST add a filter on the "
+    "'severity' column — UPPER(<severity>) IN ('ERROR','FATAL','SEVERE','CRITICAL','FAILED',"
+    "'FAIL') — and never return informational 'INFO' (or 'WARN'/'WARNING') rows unless the user "
+    "explicitly asks for warnings or for all entries. A date/time filter alone is wrong. "
+    "Worked example — 'what errors happened today?' over a log with an event_time column LOG_TIME "
+    "and a severity column SEVERITY becomes: WHERE TRUNC(LOG_TIME) = TRUNC(SYSDATE) AND "
+    "UPPER(SEVERITY) IN ('ERROR','FATAL','SEVERE','CRITICAL','FAILED','FAIL').\n"
     "- For questions about the DATABASE ITSELF (how many schemas, which tables exist, row counts, "
     "columns, constraints), use ONLY the views under 'Catalog views' below — exactly those view "
     "names, never another variant.\n"
@@ -241,20 +284,58 @@ def build_schema_context(report: ScanReport) -> dict:
         for p in report.program_semantics
     ]
 
+    log_tables = [
+        {
+            "name": _qualified(lt.table, lt.owner, multi),
+            "kind": lt.kind.value,
+            "columns": [{"name": c.column, "role": c.role.value} for c in lt.columns],
+        }
+        for lt in report.log_tables
+    ]
+
     return {
         "schema": report.schema_info.name,
         "tables": tables,
         "relationships": relationships,
         "programs": programs,
+        "log_tables": log_tables,
     }
 
 
-def build_ask_prompt(question: str, report: ScanReport, *, use_dba: bool = False) -> str:
+def _history_block(history: list[Turn]) -> str:
+    """Render the recent conversation (questions + the model's own SQL) for a follow-up prompt.
+
+    Only the last `_MAX_HISTORY` turns are kept, so the prompt stays bounded. No query results are
+    ever included — see `Turn`.
+    """
+    lines: list[str] = []
+    for i, turn in enumerate(history[-_MAX_HISTORY:], start=1):
+        lines.append(f"Q{i}: {turn.question.strip()}")
+        sql = turn.sql.strip()
+        lines.append(f"SQL{i}: {sql}" if sql else f"SQL{i}: (answered in plain language; no query)")
+    return "\n".join(lines)
+
+
+def build_ask_prompt(
+    question: str,
+    report: ScanReport,
+    *,
+    use_dba: bool = False,
+    history: list[Turn] | None = None,
+) -> str:
     context = json.dumps(build_schema_context(report), indent=2, default=str)
     catalog = catalog_reference(use_dba)
+    convo = ""
+    if history:
+        convo = (
+            "Conversation so far (earlier turns this session — the new question may refine the "
+            "latest query; build on its SQL when it is a follow-up):\n"
+            f"{_history_block(history)}\n\n"
+        )
     return (
         f"Database map (semantic, PII-safe JSON):\n{context}\n\n"
         f"Catalog views (for questions about the database itself):\n{catalog}\n\n"
+        f"{convo}"
         f"Business question:\n{question.strip()}\n\n"
         f"{_ASK_OUTPUT_CONTRACT}"
     )
@@ -296,6 +377,97 @@ def with_row_limit(sql: str, max_rows: int) -> str:
     """Wrap a validated SELECT so at most `max_rows` rows come back (Oracle ROWNUM, order-safe)."""
     n = max(1, int(max_rows))
     return f"SELECT * FROM (\n{sql}\n) WHERE ROWNUM <= {n}"
+
+
+# --------------------------------------------------- error-severity safety net
+
+# A log table holds every severity, so "errors" must filter the severity column — but a model
+# (especially over a large multi-schema map) often anchors on a table called ERROR_LOG and filters
+# only by date. This deterministic net catches that case after generation, since prompt guidance
+# alone is not reliable across models. English + Romanian, since questions come in either.
+_ERROR_INTENT = (
+    "error", "errors", "fail", "failed", "failure", "failing", "exception", "crash", "broke",
+    "eroare", "erori", "esua", "eșua", "exceptie", "excepție", "picat", "cazut", "căzut",
+)
+# Phrases that mean the user explicitly wants non-error rows too — then we must NOT filter.
+_ALL_OVERRIDE = (
+    "all entries", "all severit", "every entry", "everything logged", "include info",
+    "info", "warn", "warning", "toate intrar", "toate severit", "orice severit", "toate nivel",
+)
+
+
+def _is_error_intent(question: str) -> bool:
+    q = question.lower()
+    if any(w in q for w in _ALL_OVERRIDE):
+        return False
+    return any(w in q for w in _ERROR_INTENT)
+
+
+def _already_filters_severity(sql: str, severity_col: str) -> bool:
+    """True if the SQL already constrains the severity column (vs merely projecting it)."""
+    if re.search(rf"\b{re.escape(severity_col)}\b\s*(=|!=|<>|\bIN\b|\bLIKE\b)", sql, re.IGNORECASE):
+        return True
+    upper = sql.upper()
+    return any(f"'{lit}'" in upper for lit in (*ERROR_SEVERITIES, "INFO", "WARN", "WARNING"))
+
+
+def _is_simple_select(sql: str) -> bool:
+    """Only a single, un-nested SELECT is safe to inject a predicate into textually."""
+    upper = sql.upper()
+    if upper.count("SELECT") != 1:
+        return False
+    return not any(k in upper for k in (" UNION ", " MINUS ", " INTERSECT ", " HAVING "))
+
+
+def _severity_predicate(severity_col: str) -> str:
+    values = ", ".join(f"'{v}'" for v in ERROR_SEVERITIES)
+    return f"UPPER({severity_col}) IN ({values})"
+
+
+def _inject_severity_filter(sql: str, severity_col: str) -> str:
+    """Add the error-severity predicate to a simple SELECT, before any GROUP BY/ORDER BY/FETCH."""
+    upper = sql.upper()
+    cuts = [i for kw in ("GROUP BY", "ORDER BY", "FETCH ") if (i := upper.find(kw)) != -1]
+    cut = min(cuts) if cuts else len(sql)
+    head, tail = sql[:cut].rstrip(), sql[cut:]
+    pred = _severity_predicate(severity_col)
+    head = f"{head} AND {pred}" if re.search(r"\bWHERE\b", head, re.IGNORECASE) else \
+        f"{head} WHERE {pred}"
+    return f"{head} {tail}".rstrip() if tail.strip() else head
+
+
+def enforce_error_severity_filter(
+    question: str, result: AskResult, report: ScanReport
+) -> AskResult:
+    """If an error question's SQL hits a log table but skips its severity filter, fix or flag it.
+
+    Returns the (possibly updated) result: the severity filter is injected for a simple SELECT, or
+    an assumption is appended warning that INFO/WARN rows may be included for a complex one. A
+    deterministic backstop for the model under-filtering — independent of which model is used.
+    """
+    if not result.answerable or not _is_error_intent(question):
+        return result
+    for lt in report.log_tables:
+        sev = lt.column_for(LogRole.SEVERITY)
+        if not sev or not re.search(rf"\b{re.escape(lt.table)}\b", result.sql, re.IGNORECASE):
+            continue
+        if _already_filters_severity(result.sql, sev):
+            return result
+        if _is_simple_select(result.sql):
+            result.sql = _inject_severity_filter(result.sql, sev)
+            result.assumptions = [
+                *result.assumptions,
+                f"Restricted to error severities ({', '.join(ERROR_SEVERITIES)}) — ask for "
+                "'all entries' to include INFO/WARN rows too.",
+            ]
+        else:
+            result.assumptions = [
+                *result.assumptions,
+                f"Heads up: this did not filter {sev} to error levels, so INFO/WARN rows may be "
+                f"included. Add UPPER({sev}) IN (...) or use `blossa logs` for errors only.",
+            ]
+        return result
+    return result
 
 
 def privilege_hint(sql: str, error: str) -> str | None:

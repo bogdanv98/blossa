@@ -112,6 +112,107 @@ def test_ask_dry_run_shows_sql_without_executing(tmp_path, monkeypatch):
     assert "not executed" in result.output
 
 
+def test_ask_interactive_refines_with_history(tmp_path, monkeypatch):
+    mp = _demo_map(tmp_path)
+
+    class _RecordingProvider:
+        name = "ollama"
+        model = "fake"
+
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, system_prompt, user_prompt):
+            self.prompts.append(user_prompt)
+            return '{"sql":"SELECT COUNT(*) FROM CUSTOMERS","confidence":"high"}'
+
+    provider = _RecordingProvider()
+    import blossa.cli as climod
+
+    monkeypatch.setattr(climod, "get_provider", lambda cfg: provider)
+    monkeypatch.setattr(climod, "_preflight_llm", lambda settings: None)
+
+    # No question argument → interactive. Two turns, then a blank line to quit. --dry-run keeps it
+    # off the database while still recording the model's SQL into the conversation history.
+    result = runner.invoke(
+        app,
+        ["ask", "--map", str(mp), "--llm-provider", "ollama", "--dry-run"],
+        input="how many customers?\nnow break it down by country\n\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Interactive ask" in result.output
+    # Two questions → two model calls; the second must carry the first turn as history.
+    assert len(provider.prompts) == 2
+    assert "Conversation so far" not in provider.prompts[0]
+    assert "Conversation so far" in provider.prompts[1]
+    assert "how many customers?" in provider.prompts[1]
+
+
+def _applog_map(tmp_path):
+    """A scan JSON map carrying one detected error-log table, for the `logs` command."""
+    from datetime import UTC, datetime
+
+    from blossa.models import (
+        ColumnInfo,
+        ConstraintInfo,
+        ConstraintType,
+        ScanMetadata,
+        ScanReport,
+        SchemaInfo,
+        TableInfo,
+    )
+
+    table = TableInfo(
+        name="ERROR_LOG",
+        owner="APPLOG",
+        columns=[
+            ColumnInfo(name="ERROR_ID", data_type="NUMBER"),
+            ColumnInfo(name="LOG_TIME", data_type="TIMESTAMP"),
+            ColumnInfo(name="SEVERITY", data_type="VARCHAR2", data_length=10),
+            ColumnInfo(name="MODULE", data_type="VARCHAR2", data_length=80),
+            ColumnInfo(name="MESSAGE", data_type="VARCHAR2", data_length=2000),
+        ],
+        constraints=[
+            ConstraintInfo(name="pk", type=ConstraintType.PRIMARY_KEY, columns=["ERROR_ID"])
+        ],
+    )
+    from blossa.logs import detect_log_tables
+
+    schema = SchemaInfo(name="APPLOG", tables=[table])
+    report = ScanReport(
+        metadata=ScanMetadata(
+            blossa_version="0", schema_name="APPLOG",
+            generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            llm_provider="ollama", table_count=1,
+        ),
+        schema_info=schema,
+        log_tables=detect_log_tables(schema),
+    )
+    mp = tmp_path / "applog_map.json"
+    mp.write_text(report.model_dump_json(), encoding="utf-8")
+    return mp
+
+
+def test_logs_explain_refuses_remote_provider(tmp_path):
+    # Root-cause --explain reads real error text, so it must refuse a remote model and never touch
+    # the database (the refusal comes before any query).
+    mp = _applog_map(tmp_path)
+    result = runner.invoke(
+        app, ["logs", "--map", str(mp), "--llm-provider", "openai_compatible", "--explain"]
+    )
+    assert result.exit_code == 1
+    assert "remote model" in result.output or "LOCAL model" in result.output
+
+
+def test_logs_explain_refuses_heuristic(tmp_path):
+    mp = _applog_map(tmp_path)
+    result = runner.invoke(
+        app, ["logs", "--map", str(mp), "--llm-provider", "heuristic", "--explain"]
+    )
+    assert result.exit_code == 1
+    assert "model provider" in result.output
+
+
 def test_ask_without_map_errors(tmp_path):
     missing = tmp_path / "nope.json"
     result = runner.invoke(

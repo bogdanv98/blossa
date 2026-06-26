@@ -24,17 +24,27 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..config import Settings
 from ..db.connection import Database
 from ..llm import get_provider
 from ..llm.base import LLMProvider
-from ..models import ScanReport
+from ..logsense import (
+    LOCAL_PROVIDERS,
+    choose_log_table,
+    local_only_message,
+    recent_entries_sql,
+    redact_entries,
+    run_root_cause,
+)
+from ..models import LogRole, ScanReport
 from ..nlquery import (
     ASK_SYSTEM_PROMPT,
+    Turn,
     UnsafeQueryError,
     build_ask_prompt,
+    enforce_error_severity_filter,
     parse_ask_response,
     privilege_hint,
     validate_read_only_select,
@@ -121,6 +131,18 @@ def build_map_view(report: ScanReport) -> dict:
         for p in report.program_semantics
     ]
 
+    log_tables = [
+        {
+            "name": q(lt.table, lt.owner),
+            "owner": lt.owner,
+            "kind": lt.kind.value,
+            "confidence": lt.confidence.value,
+            "columns": [{"column": c.column, "role": c.role.value} for c in lt.columns],
+            "evidence": lt.evidence,
+        }
+        for lt in report.log_tables
+    ]
+
     return {
         "schema_name": report.metadata.schema_name,
         "multi_schema": multi,
@@ -128,16 +150,25 @@ def build_map_view(report: ScanReport) -> dict:
         "provider": report.metadata.llm_provider,
         "tables": tables,
         "programs": programs,
+        "log_tables": log_tables,
     }
 
 
 class AskBody(BaseModel):
     question: str
+    # Prior turns (question + the model's own SQL), so a follow-up can refine the last query.
+    # Never carries results — the no-raw-rows-to-the-model boundary holds across turns.
+    history: list[Turn] = Field(default_factory=list)
 
 
 class RunBody(BaseModel):
     sql: str
     max_rows: int = 100
+
+
+class ExplainLogBody(BaseModel):
+    table: str | None = None  # which log table; None = auto-pick the main error log
+    limit: int = 50
 
 
 def create_app(
@@ -172,12 +203,15 @@ def create_app(
         if not question:
             raise HTTPException(status_code=400, detail="Ask a question.")
         prov = _ensure_provider()
-        prompt = build_ask_prompt(question, report, use_dba=settings.oracle.use_dba_catalog)
+        prompt = build_ask_prompt(
+            question, report, use_dba=settings.oracle.use_dba_catalog, history=body.history
+        )
         try:
             raw = prov.generate(ASK_SYSTEM_PROMPT, prompt)
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
-        return parse_ask_response(raw).model_dump()
+        result = enforce_error_severity_filter(question, parse_ask_response(raw), report)
+        return result.model_dump()
 
     @app.post("/api/run")
     def post_run(body: RunBody) -> dict:
@@ -201,6 +235,34 @@ def create_app(
             "row_count": len(rows),
             "capped": len(rows) >= body.max_rows,
         }
+
+    @app.post("/api/logs/explain")
+    def post_explain_log(body: ExplainLogBody) -> dict:
+        # Reads real error text → only allowed with a LOCAL model, where data never leaves the box.
+        if settings.llm.provider == "heuristic":
+            raise HTTPException(
+                status_code=400,
+                detail="Explaining errors needs a model provider (the offline heuristic can't "
+                "read error text).",
+            )
+        if settings.llm.provider not in LOCAL_PROVIDERS:
+            raise HTTPException(status_code=400, detail=local_only_message())
+        lt = choose_log_table(report.log_tables, body.table)
+        if lt is None:
+            raise HTTPException(status_code=404, detail="No matching log table in this map.")
+        prov = _ensure_provider()
+        sql = recent_entries_sql(lt, limit=body.limit, only_errors=True)
+        try:
+            with make_db() as db:
+                rows = db.query(sql)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Log query failed: {exc}") from exc
+        redacted = redact_entries(rows, lt.column_for(LogRole.MESSAGE))
+        try:
+            rc = run_root_cause(prov, lt.table, redacted)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
+        return rc.model_dump()
 
     @app.get("/")
     def index() -> FileResponse:

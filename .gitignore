@@ -29,6 +29,7 @@ samples/*_truth.json
 # Local config / secrets (never commit credentials)
 blossa.local.yml
 .env
+scratchpad/
 
 # Editors / OS
 .vscode/

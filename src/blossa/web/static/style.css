@@ -51,8 +51,27 @@ button {
 }
 button:disabled { opacity: .55; cursor: default; }
 
+button.ghost {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--line); padding: 0 14px;
+}
+button.ghost:hover { color: var(--ink); border-color: var(--muted); }
+
 .status { min-height: 20px; margin: 12px 0; color: var(--muted); }
 .status.error { color: var(--low); }
+
+/* Conversation thread (earlier turns of a multi-turn ask) ----------------- */
+#thread { margin-top: 14px; }
+.turn { border-left: 3px solid var(--line); padding: 2px 0 2px 12px; margin-bottom: 12px; }
+.turn-q { margin: 0 0 6px; font-weight: 600; }
+.turn-q::before { content: "› "; color: var(--accent); }
+.turn-sql {
+  margin: 0; padding: 8px 10px; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--code-bg); color: var(--code-ink); border-radius: 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.current-question { margin: 4px 0 8px; font-weight: 600; }
+.current-question::before { content: "› "; color: var(--accent); }
 
 #answer { margin-top: 8px; }
 .sql-head { display: flex; align-items: center; justify-content: space-between; }
@@ -106,3 +125,21 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .program-card p { margin: 8px 0 0; font-size: 14px; }
 .program-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .program-head code { font-size: 14px; font-weight: 600; }
+
+/* Application logs ------------------------------------------------------- */
+#logs-search {
+  width: 100%; padding: 9px 12px; border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 6px; background: var(--panel);
+}
+.log-roles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.log-role {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 3px 8px; font-size: 13px;
+}
+.log-role-name { color: var(--muted); text-transform: capitalize; }
+.log-role code { font-size: 13px; }
+.log-actions { margin-top: 12px; }
+.log-causes { margin-top: 10px; }
+.cause { border-left: 3px solid var(--line); padding: 2px 0 2px 12px; margin: 10px 0; }
+.cause-head { margin: 0 0 2px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cause p { margin: 2px 0; }

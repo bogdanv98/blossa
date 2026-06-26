@@ -35,13 +35,31 @@ async function loadMap() {
   $("#schema-name").textContent = label;
   renderTableList(MAP.tables);
   renderPrograms(MAP.programs || []);
+  renderLogs(MAP.log_tables || []);
 }
 
 // --- ask --------------------------------------------------------------------
+// Multi-turn refine: prior turns (question + the SQL the model produced) are sent back so a
+// follow-up like "now break it down by year" can build on the last query. Only questions and SQL
+// travel back to the model — never query results — so the no-raw-rows boundary holds across turns.
+let CONVERSATION = []; // confirmed earlier turns: [{question, sql}]
+let pendingTurn = null; // the latest answered turn, not yet folded into CONVERSATION
+
+function foldPending() {
+  if (!pendingTurn) return;
+  // Respect manual SQL edits: if the answer panel is showing this turn's query, record what's in
+  // the box now (the user may have tweaked it before refining).
+  const shown = !$("#answer").classList.contains("hidden");
+  const sql = shown ? $("#sql").value.trim() : pendingTurn.sql;
+  CONVERSATION.push({ question: pendingTurn.question, sql });
+  pendingTurn = null;
+}
+
 $("#ask-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const question = $("#question").value.trim();
   if (!question) return;
+  foldPending(); // the previous turn becomes history before we ask the next one
   setStatus("#ask-status", "Translating your question to SQL…");
   $("#answer").classList.add("hidden");
   $("#ask-btn").disabled = true;
@@ -49,7 +67,7 @@ $("#ask-form").addEventListener("submit", async (e) => {
     const res = await fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, history: CONVERSATION }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Ask failed.");
@@ -57,9 +75,14 @@ $("#ask-form").addEventListener("submit", async (e) => {
       // No SQL: a plain-language answer (e.g. "what does this procedure do") or a genuine
       // "can't answer". The model's explanation is the response — show it, not as an error.
       setStatus("#ask-status", data.explanation || "I couldn't turn that into a query.");
+      pendingTurn = { question, sql: "" }; // still part of the thread for the next follow-up
+      renderThread();
       return;
     }
+    pendingTurn = { question, sql: data.sql };
     showAnswer(data);
+    renderThread();
+    $("#question").value = "";
     setStatus("#ask-status", "");
     runSql(); // auto-run; the SQL stays visible and editable for re-running
   } catch (err) {
@@ -69,8 +92,35 @@ $("#ask-form").addEventListener("submit", async (e) => {
   }
 });
 
+// "New thread" forgets the conversation so the next question starts fresh.
+$("#new-thread-btn").addEventListener("click", () => {
+  CONVERSATION = [];
+  pendingTurn = null;
+  $("#answer").classList.add("hidden");
+  $("#question").value = "";
+  setStatus("#ask-status", "");
+  renderThread();
+  $("#question").focus();
+});
+
+function renderThread() {
+  const box = $("#thread");
+  box.replaceChildren();
+  const hasConvo = CONVERSATION.length > 0 || pendingTurn !== null;
+  $("#new-thread-btn").classList.toggle("hidden", !hasConvo);
+  $("#question").placeholder = hasConvo
+    ? "Refine it — e.g. now break it down by year, or only the top 5…"
+    : "Ask in plain language, e.g. how many employees per department?";
+  CONVERSATION.forEach((t) => {
+    const turn = el("div", { class: "turn" }, el("p", { class: "turn-q", text: t.question }));
+    if (t.sql) turn.append(el("pre", { class: "turn-sql", text: t.sql }));
+    box.append(turn);
+  });
+}
+
 function showAnswer(data) {
   $("#answer").classList.remove("hidden");
+  $("#current-question").textContent = pendingTurn ? pendingTurn.question : "";
   $("#sql").value = data.sql;
   $("#explanation").textContent = data.explanation || "";
   const badge = $("#confidence");
@@ -237,6 +287,91 @@ $("#logic-search").addEventListener("input", (e) => {
     p.name.toLowerCase().includes(q) ||
     (p.summary || "").toLowerCase().includes(q) ||
     (p.tables_used || []).join(" ").toLowerCase().includes(q)
+  ));
+});
+
+// --- application logs -------------------------------------------------------
+function renderLogs(logs) {
+  const box = $("#logs");
+  box.replaceChildren();
+  if (!logs.length) {
+    box.append(el("p", { class: "muted", text: "No application log/error/audit tables were recognised in this schema." }));
+    return;
+  }
+  logs.forEach((lt) => {
+    const card = el("div", { class: "program-card" });
+    card.append(el("div", { class: "program-head" },
+      el("code", { text: lt.name }),
+      el("span", { class: "pill", text: lt.kind }),
+      lt.confidence ? el("span", { class: "badge " + lt.confidence, text: lt.confidence }) : el("span", {})
+    ));
+    const roles = el("div", { class: "log-roles" });
+    (lt.columns || []).forEach((c) =>
+      roles.append(el("span", { class: "log-role" },
+        el("span", { class: "log-role-name", text: c.role.replace(/_/g, " ") }),
+        el("code", { text: c.column })
+      ))
+    );
+    card.append(roles);
+    if (lt.evidence && lt.evidence.length)
+      card.append(el("p", { class: "muted small", text: "Why: " + lt.evidence.join("; ") }));
+
+    // Root-cause explanation reads real error text → only offered for logs that have a message,
+    // and the server still refuses unless the model is local. Results render inline.
+    const hasMessage = (lt.columns || []).some((c) => c.role === "message");
+    if (hasMessage) {
+      const out = el("div", { class: "log-causes" });
+      const btn = el("button", { class: "ghost", type: "button", text: "Explain recent errors" });
+      btn.addEventListener("click", () => explainLog(lt.name, btn, out));
+      card.append(el("div", { class: "log-actions" }, btn));
+      card.append(out);
+    }
+    box.append(card);
+  });
+}
+
+async function explainLog(name, btn, out) {
+  btn.disabled = true;
+  out.replaceChildren(el("p", { class: "muted small", text: "Clustering recent errors with the local model…" }));
+  try {
+    const res = await fetch("/api/logs/explain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Explain failed.");
+    out.replaceChildren();
+    const note = `From ${data.sample_size} redacted entries — the error text stayed on this machine.`;
+    out.append(el("p", { class: "muted small", text: note }));
+    if (!data.clusters || !data.clusters.length) {
+      out.append(el("p", { class: "muted small", text: data.note || "No clusters found." }));
+      return;
+    }
+    data.clusters.forEach((c) => {
+      const item = el("div", { class: "cause" });
+      const head = el("p", { class: "cause-head" }, el("strong", { text: c.cause }));
+      if (c.count) head.append(el("span", { class: "muted small", text: `  ×${c.count}` }));
+      if (c.severity) head.append(el("span", { class: "badge", text: c.severity }));
+      item.append(head);
+      if (c.suggested_action) item.append(el("p", { class: "small", text: "→ " + c.suggested_action }));
+      if (c.example) item.append(el("p", { class: "muted small", text: "e.g. " + c.example }));
+      out.append(item);
+    });
+  } catch (err) {
+    out.replaceChildren(el("p", { class: "status error small", text: err.message }));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("#logs-search").addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase();
+  const all = MAP.log_tables || [];
+  renderLogs(all.filter((lt) =>
+    lt.name.toLowerCase().includes(q) ||
+    lt.kind.toLowerCase().includes(q) ||
+    (lt.columns || []).map((c) => c.column + " " + c.role).join(" ").toLowerCase().includes(q)
   ));
 });
 

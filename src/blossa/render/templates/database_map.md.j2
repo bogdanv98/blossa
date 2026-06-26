@@ -92,6 +92,20 @@ _No findings._
 {% endfor %}
 
 {% endif %}
+{% if report.log_tables %}
+## Application logs
+
+> Tables that record what happened to the business data — error/exception logs, change-audit
+> trails, batch-job logs. Recognised from their name and column shape; each column is tagged with
+> the role an analyst would group, filter or sort on.
+
+| Log table | Kind | Conf. | Columns (role → column) |
+| --- | --- | --- | --- |
+{% for lt in report.log_tables %}
+| `{{ (lt.owner ~ "." if multi_schema and lt.owner else "") }}{{ lt.table }}` | {{ lt.kind.value }} | {{ lt.confidence | confidence }} | {% for c in lt.columns %}{{ c.role.value }} → `{{ c.column }}`{{ ", " if not loop.last else "" }}{% endfor %} |
+{% endfor %}
+
+{% endif %}
 ---
 
 ## Table details

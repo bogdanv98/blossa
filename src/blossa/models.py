@@ -63,6 +63,28 @@ class Severity(StrEnum):
     NOTICE = "notice"
 
 
+class LogKind(StrEnum):
+    """What kind of application log/audit table Blossa thinks it found."""
+
+    ERROR = "error"  # error / exception logs
+    AUDIT = "audit"  # who-changed-what change trails
+    JOB = "job"  # batch / scheduled-job run logs
+    EVENT = "event"  # generic application event logs
+    GENERIC = "generic"  # log-shaped but the specific kind is unclear
+
+
+class LogRole(StrEnum):
+    """The role a column plays inside a log table (what an analyst joins/filters/groups on)."""
+
+    EVENT_TIME = "event_time"  # when the entry was recorded
+    SEVERITY = "severity"  # ERROR / WARN / INFO / FATAL (or a status like SUCCESS/FAILED)
+    MESSAGE = "message"  # the free-text error/event message
+    SOURCE = "source"  # module / procedure / job / component that emitted it
+    ACTOR = "actor"  # the user / account responsible
+    BUSINESS_REF = "business_ref"  # a reference to a business entity (often an FK / *_ID)
+    CODE = "code"  # an error/status code
+
+
 class FindingKind(StrEnum):
     UNDECLARED_FK_CANDIDATE = "undeclared_fk_candidate"
     ORPHAN_ROWS = "orphan_rows"
@@ -225,6 +247,33 @@ class Finding(BaseModel):
     details: dict[str, str | int | float] = Field(default_factory=dict)
 
 
+class LogColumn(BaseModel):
+    """A column inside a log table, tagged with the role it plays."""
+
+    column: str
+    role: LogRole
+
+
+class LogTable(BaseModel):
+    """A table Blossa believes is an application log / error / audit table.
+
+    Detected deterministically (no LLM) from the table name, its column shape, and profiling
+    signals. `columns` lists only the role-bearing columns — the ones an analyst would group,
+    filter or sort on (when / severity / message / source / actor / business reference / code).
+    """
+
+    table: str
+    owner: str | None = None
+    kind: LogKind = LogKind.GENERIC
+    confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
+    evidence: list[str] = Field(default_factory=list)
+    columns: list[LogColumn] = Field(default_factory=list)
+
+    def column_for(self, role: LogRole) -> str | None:
+        """The first column playing `role`, if any (e.g. the event-time column to order by)."""
+        return next((c.column for c in self.columns if c.role == role), None)
+
+
 # -------------------------------------------------------- PII-safe LLM summary
 
 
@@ -307,9 +356,13 @@ class ScanReport(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     semantics: list[TableSemantics] = Field(default_factory=list)
     program_semantics: list[ProgramSemantics] = Field(default_factory=list)
+    log_tables: list[LogTable] = Field(default_factory=list)
 
     def semantics_for(self, table: str) -> TableSemantics | None:
         return next((s for s in self.semantics if s.table == table), None)
 
     def findings_for(self, table: str) -> list[Finding]:
         return [f for f in self.findings if f.table == table]
+
+    def log_table_for(self, table: str) -> LogTable | None:
+        return next((lt for lt in self.log_tables if lt.table == table), None)

@@ -22,8 +22,10 @@ from .db.introspect import introspect_schemas, list_non_system_schemas
 from .db.profile import profile_table
 from .llm import get_provider
 from .llm.base import LLMProvider
+from .logs import detect_log_tables
 from .models import (
     Finding,
+    LogTable,
     ProgramSemantics,
     Relationship,
     ScanMetadata,
@@ -124,6 +126,7 @@ def assemble_report(
     provider: LLMProvider,
     profiling_enabled: bool,
     programs: list[ProgramSemantics] | None = None,
+    log_tables: list[LogTable] | None = None,
 ) -> ScanReport:
     metadata = ScanMetadata(
         blossa_version=__version__,
@@ -141,6 +144,7 @@ def assemble_report(
         findings=findings,
         semantics=semantics,
         program_semantics=programs or [],
+        log_tables=log_tables or [],
     )
 
 
@@ -155,6 +159,9 @@ def run_scan_over_schema(
     """Run checks → summaries → semantic pass → report over an already-introspected schema."""
     status("Running deterministic checks ...")
     relationships, findings = analyze(schema, settings, db, owner)
+    log_tables = detect_log_tables(schema)
+    if log_tables:
+        status(f"Recognised {len(log_tables)} application log table(s).")
     semantics = semantic(schema, relationships, provider, status)
     programs = program_semantics(schema, provider, status)
     return assemble_report(
@@ -165,6 +172,7 @@ def run_scan_over_schema(
         provider,
         profiling_enabled=not settings.scan.skip_profiling,
         programs=programs,
+        log_tables=log_tables,
     )
 
 

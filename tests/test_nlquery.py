@@ -5,7 +5,10 @@ import pytest
 from blossa.config import Settings
 from blossa.demo import build_demo_schema
 from blossa.llm.heuristic import HeuristicProvider
+from blossa.models import ConfidenceLevel, LogColumn, LogKind, LogRole, LogTable
 from blossa.nlquery import (
+    _MAX_HISTORY,
+    Turn,
     UnsafeQueryError,
     build_ask_prompt,
     build_schema_context,
@@ -166,6 +169,159 @@ def test_prompt_covers_other_object_kinds_and_a_safety_net():
     assert "ALL_SCHEDULER_CHAINS" in scoped and "DBA_SCHEDULER_CHAINS" in full
     for prompt in (scoped, full):
         assert "ask the user to clarify rather than guessing" in prompt
+
+
+# --------------------------------------------------------- log-aware ask
+
+
+def _report_with_log_table():
+    report = _demo_report()
+    report.log_tables.append(
+        LogTable(
+            table="ERROR_LOG",
+            kind=LogKind.ERROR,
+            confidence=ConfidenceLevel.HIGH,
+            columns=[
+                LogColumn(column="LOG_TIME", role=LogRole.EVENT_TIME),
+                LogColumn(column="SEVERITY", role=LogRole.SEVERITY),
+                LogColumn(column="MESSAGE", role=LogRole.MESSAGE),
+                LogColumn(column="ORDER_ID", role=LogRole.BUSINESS_REF),
+            ],
+        )
+    )
+    return report
+
+
+def test_context_exposes_log_tables_with_roles():
+    ctx = build_schema_context(_report_with_log_table())
+    assert ctx["log_tables"], "log tables should be in the model-facing context"
+    lt = ctx["log_tables"][0]
+    assert lt["name"] == "ERROR_LOG" and lt["kind"] == "error"
+    roles = {c["name"]: c["role"] for c in lt["columns"]}
+    assert roles["LOG_TIME"] == "event_time" and roles["MESSAGE"] == "message"
+
+
+def test_prompt_carries_log_tables_and_guidance():
+    prompt = build_ask_prompt("what are the most common errors?", _report_with_log_table())
+    assert "ERROR_LOG" in prompt and "event_time" in prompt
+    # The system prompt steers error/log questions toward the log tables.
+    from blossa.nlquery import ASK_SYSTEM_PROMPT
+
+    assert "log_tables" in ASK_SYSTEM_PROMPT
+    assert "ERRORS" in ASK_SYSTEM_PROMPT and "event_time" in ASK_SYSTEM_PROMPT
+    # "errors" must filter severity, not just date — INFO/WARN excluded unless asked for.
+    assert "'FATAL'" in ASK_SYSTEM_PROMPT and "INFO" in ASK_SYSTEM_PROMPT
+    assert "date/time filter alone is wrong" in ASK_SYSTEM_PROMPT.replace("\n", " ")
+
+
+# --------------------------------------------------- error-severity safety net
+
+
+def _ask(sql):
+    from blossa.nlquery import AskResult
+
+    return AskResult(sql=sql, confidence=ConfidenceLevel.HIGH)
+
+
+def test_error_filter_injected_when_missing_no_where():
+    from blossa.nlquery import enforce_error_severity_filter
+
+    report = _report_with_log_table()  # ERROR_LOG has a SEVERITY column
+    out = enforce_error_severity_filter(
+        "what errors happened today?",
+        _ask("SELECT * FROM ERROR_LOG WHERE TRUNC(LOG_TIME) = TRUNC(SYSDATE)"),
+        report,
+    )
+    assert "UPPER(SEVERITY) IN" in out.sql and "'FATAL'" in out.sql
+    assert "AND UPPER(SEVERITY)" in out.sql  # appended to the existing WHERE
+    assert any("error severities" in a for a in out.assumptions)
+
+
+def test_error_filter_added_as_where_when_none_and_before_order_by():
+    from blossa.nlquery import enforce_error_severity_filter
+
+    out = enforce_error_severity_filter(
+        "show me errors", _ask("SELECT MESSAGE FROM ERROR_LOG ORDER BY LOG_TIME DESC"),
+        _report_with_log_table(),
+    )
+    # WHERE inserted before ORDER BY, not after it.
+    assert out.sql.index("WHERE") < out.sql.index("ORDER BY")
+    assert "UPPER(SEVERITY) IN" in out.sql
+
+
+def test_error_filter_not_applied_when_already_filtered():
+    from blossa.nlquery import enforce_error_severity_filter
+
+    sql = "SELECT * FROM ERROR_LOG WHERE SEVERITY = 'FATAL'"
+    out = enforce_error_severity_filter("errors today", _ask(sql), _report_with_log_table())
+    assert out.sql == sql  # untouched
+    assert out.assumptions == []
+
+
+def test_error_filter_skipped_for_non_error_question():
+    from blossa.nlquery import enforce_error_severity_filter
+
+    sql = "SELECT * FROM ERROR_LOG WHERE TRUNC(LOG_TIME) = TRUNC(SYSDATE)"
+    out = enforce_error_severity_filter("show all log entries today", _ask(sql),
+                                        _report_with_log_table())
+    assert out.sql == sql  # "all ... entries" override → no filter
+
+
+def test_error_filter_warns_on_complex_sql_without_rewriting():
+    from blossa.nlquery import enforce_error_severity_filter
+
+    # A GROUP BY with no severity filter is still rewritten (simple single SELECT)...
+    simple = enforce_error_severity_filter(
+        "which module had the most errors?",
+        _ask("SELECT MODULE, COUNT(*) FROM ERROR_LOG GROUP BY MODULE"),
+        _report_with_log_table(),
+    )
+    assert "WHERE UPPER(SEVERITY) IN" in simple.sql
+    assert simple.sql.index("WHERE") < simple.sql.index("GROUP BY")
+
+    # ...but a UNION is too complex to touch: warn instead of rewrite.
+    union_sql = "SELECT MESSAGE FROM ERROR_LOG UNION SELECT MESSAGE FROM ERROR_LOG"
+    complex_out = enforce_error_severity_filter("errors", _ask(union_sql), _report_with_log_table())
+    assert complex_out.sql == union_sql
+    assert any("INFO/WARN" in a for a in complex_out.assumptions)
+
+
+# --------------------------------------------------------- multi-turn refine
+
+
+def test_prompt_without_history_has_no_conversation_block():
+    prompt = build_ask_prompt("how many customers?", _demo_report())
+    assert "Conversation so far" not in prompt
+
+
+def test_prompt_includes_prior_questions_and_sql():
+    history = [Turn(question="how many customers?", sql="SELECT COUNT(*) FROM CUSTOMERS")]
+    prompt = build_ask_prompt("now break it down by country", _demo_report(), history=history)
+    assert "Conversation so far" in prompt
+    assert "how many customers?" in prompt
+    assert "SELECT COUNT(*) FROM CUSTOMERS" in prompt  # the model can build on its last query
+    assert "now break it down by country" in prompt  # the new (follow-up) question
+
+
+def test_plain_language_turn_is_marked_without_sql():
+    history = [Turn(question="what does the order trigger do?", sql="")]
+    prompt = build_ask_prompt("and the customer one?", _demo_report(), history=history)
+    assert "answered in plain language" in prompt
+
+
+def test_history_is_capped_to_recent_turns():
+    history = [Turn(question=f"q{i}", sql=f"SELECT {i} FROM dual") for i in range(_MAX_HISTORY + 5)]
+    prompt = build_ask_prompt("latest", _demo_report(), history=history)
+    # The oldest turns are dropped; only the most recent _MAX_HISTORY survive.
+    assert "q0" not in prompt and "SELECT 0 FROM dual" not in prompt
+    assert f"q{_MAX_HISTORY + 4}" in prompt
+
+
+def test_system_prompt_describes_followups():
+    from blossa.nlquery import ASK_SYSTEM_PROMPT
+
+    assert "FOLLOW-UP" in ASK_SYSTEM_PROMPT
+    assert "most recent SQL" in ASK_SYSTEM_PROMPT
 
 
 # --------------------------------------------------------- catalog privilege hint

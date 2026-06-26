@@ -23,11 +23,24 @@ from .diagnostics import check_llm as diag_check_llm
 from .evaluation import build_ground_truth, evaluate
 from .grants import build_grants_sql
 from .llm import get_provider
-from .models import ScanReport
+from .logsense import (
+    LOCAL_PROVIDERS,
+    choose_log_table,
+    local_only_message,
+    recent_entries_sql,
+    redact_entries,
+    run_root_cause,
+    severity_breakdown_sql,
+    source_breakdown_sql,
+)
+from .models import LogRole, ScanReport
 from .nlquery import (
     ASK_SYSTEM_PROMPT,
+    AskResult,
+    Turn,
     UnsafeQueryError,
     build_ask_prompt,
+    enforce_error_severity_filter,
     parse_ask_response,
     privilege_hint,
     validate_read_only_select,
@@ -158,9 +171,162 @@ def _print_summary(report, md_path: Path, json_path: Path) -> None:
     console.print(f"  [cyan]{json_path}[/cyan]")
 
 
+def _load_map_report(settings: Settings, map_path: Path | None) -> ScanReport:
+    """Load the scan JSON map to ground on, or exit with actionable guidance if it's missing."""
+    if map_path is None:
+        map_path = Path(settings.output.dir) / f"{settings.output.name}.json"
+    if not map_path.exists():
+        err.print(
+            f"[bold red]No database map at[/bold red] {map_path}. "
+            "Run [cyan]blossa scan[/cyan] first, or point to one with [cyan]--map[/cyan]."
+        )
+        raise typer.Exit(code=1)
+    try:
+        return ScanReport.model_validate_json(map_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Could not read the map:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _require_ask_provider(settings: Settings):
+    """Ensure a usable model provider for `ask` (the offline heuristic can't translate to SQL)."""
+    if settings.llm.provider == "heuristic":
+        err.print(
+            "[bold red]`ask` needs a model provider[/bold red] (ollama or openai_compatible); "
+            "the offline heuristic can't translate questions to SQL."
+        )
+        raise typer.Exit(code=1)
+    _preflight_llm(settings)
+    return get_provider(settings.llm)
+
+
+def _print_proposal(result: AskResult) -> None:
+    console.print()
+    console.print(Syntax(result.sql, "sql", theme="ansi_dark", word_wrap=True))
+    if result.explanation:
+        console.print(f"[dim]{result.explanation}[/dim]")
+    if result.assumptions:
+        console.print("[bold]Assumptions:[/bold]")
+        for a in result.assumptions:
+            console.print(f"  - {a}")
+    console.print(f"[dim]Confidence:[/dim] {result.confidence.value}")
+
+
+def _answer_ask_turn(
+    question: str,
+    report: ScanReport,
+    provider,
+    settings: Settings,
+    *,
+    history: list[Turn],
+    max_rows: int,
+    dry_run: bool,
+    strict: bool,
+) -> AskResult | None:
+    """Translate one question to SQL (optionally as a follow-up) and run it.
+
+    `history` carries prior question+SQL pairs so a follow-up can refine the last query; only that
+    metadata reaches the model, never results. `strict` (one-shot CLI) turns failures into process
+    exits with meaningful codes; interactive mode passes strict=False so the session continues.
+    Returns the proposal (whatever the model produced), or None if the model call itself failed.
+    """
+    _status("Translating your question to SQL ...")
+    try:
+        prompt = build_ask_prompt(
+            question, report, use_dba=settings.oracle.use_dba_catalog, history=history
+        )
+        raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+        if strict:
+            raise typer.Exit(code=1) from exc
+        return None
+    result = parse_ask_response(raw)
+    result = enforce_error_severity_filter(question, result, report)
+
+    if not result.answerable:
+        # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from
+        # the map's program summaries, or a genuine "can't answer". Either way the model's text is
+        # the response — show it.
+        if result.explanation:
+            console.print(result.explanation)
+            return result
+        err.print("[yellow]I couldn't turn that into a query for this schema.[/yellow]")
+        if strict:
+            raise typer.Exit(code=2)
+        return result
+
+    _print_proposal(result)
+
+    if dry_run:
+        console.print("[dim](--dry-run: query not executed)[/dim]")
+        return result
+
+    try:
+        safe_sql = validate_read_only_select(result.sql)
+    except UnsafeQueryError as exc:
+        err.print(f"[bold red]Refusing to run this query:[/bold red] {exc}")
+        if strict:
+            raise typer.Exit(code=1) from exc
+        return result
+
+    try:
+        with Database(settings.oracle) as db:
+            rows = db.query(with_row_limit(safe_sql, max_rows))
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Query failed:[/bold red] {exc}")
+        hint = privilege_hint(safe_sql, str(exc))
+        if hint:
+            err.print(f"  [dim]{hint}[/dim]")
+        if strict:
+            raise typer.Exit(code=1) from exc
+        return result
+
+    _print_rows(rows, max_rows)
+    return result
+
+
+def _interactive_ask(
+    report: ScanReport, provider, settings: Settings, max_rows: int, dry_run: bool
+) -> None:
+    """A multi-turn REPL: ask a question, then refine it; each turn can build on the last query."""
+    console.print(
+        "[bold]Interactive ask[/bold] - ask a question, then refine it "
+        "(e.g. [italic]now break it down by year[/italic], [italic]only the top 5[/italic]).\n"
+        "[dim]Blank line or [cyan]exit[/cyan] to quit; [cyan]reset[/cyan] to start a fresh "
+        "thread.[/dim]\n"
+    )
+    history: list[Turn] = []
+    while True:
+        try:
+            question = typer.prompt(
+                "ask", default="", show_default=False, prompt_suffix="> "
+            ).strip()
+        except (EOFError, typer.Abort, KeyboardInterrupt):
+            break
+        if not question or question.lower() in {"exit", "quit"}:
+            break
+        if question.lower() == "reset":
+            history = []
+            console.print("[dim]Started a fresh thread.[/dim]\n")
+            continue
+        result = _answer_ask_turn(
+            question, report, provider, settings,
+            history=history, max_rows=max_rows, dry_run=dry_run, strict=False,
+        )
+        if result is not None:
+            # Record the turn so the next question can refine it. Only the question and the model's
+            # own SQL are kept — never the rows.
+            history.append(Turn(question=question, sql=result.sql))
+        console.print()
+    console.print("[dim]Bye.[/dim]")
+
+
 @app.command()
 def ask(
-    question: str = typer.Argument(..., help="Your question, in plain language."),
+    question: str | None = typer.Argument(
+        None, help="Your question, in plain language. Omit it to start an interactive session."
+    ),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to a config file."),
     map_path: Path | None = typer.Option(
         None, "--map", "-m", help="Scan JSON map to ground on (default: <out>/<name>.json)."
@@ -173,84 +339,24 @@ def ask(
 
     Grounds on the database map from `blossa scan`. The model sees only the semantic map (never
     raw data); the generated SQL is shown to you and validated read-only before it runs.
+
+    Pass a question for a one-shot answer, or omit it to open an interactive session where each
+    follow-up ("now break it down by year") refines the previous query.
     """
     settings = load_settings(config)
     if llm_provider:
         settings.llm.provider = llm_provider
 
-    if map_path is None:
-        map_path = Path(settings.output.dir) / f"{settings.output.name}.json"
-    if not map_path.exists():
-        err.print(
-            f"[bold red]No database map at[/bold red] {map_path}. "
-            "Run [cyan]blossa scan[/cyan] first, or point to one with [cyan]--map[/cyan]."
+    report = _load_map_report(settings, map_path)
+    provider = _require_ask_provider(settings)
+
+    if question is not None and question.strip():
+        _answer_ask_turn(
+            question.strip(), report, provider, settings,
+            history=[], max_rows=max_rows, dry_run=dry_run, strict=True,
         )
-        raise typer.Exit(code=1)
-    try:
-        report = ScanReport.model_validate_json(map_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]Could not read the map:[/bold red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    if settings.llm.provider == "heuristic":
-        err.print(
-            "[bold red]`ask` needs a model provider[/bold red] (ollama or openai_compatible); "
-            "the offline heuristic can't translate questions to SQL."
-        )
-        raise typer.Exit(code=1)
-    _preflight_llm(settings)
-    provider = get_provider(settings.llm)
-
-    _status("Translating your question to SQL ...")
-    try:
-        prompt = build_ask_prompt(question, report, use_dba=settings.oracle.use_dba_catalog)
-        raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
-        raise typer.Exit(code=1) from exc
-    result = parse_ask_response(raw)
-
-    if not result.answerable:
-        # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from
-        # the map's program summaries, or a genuine "can't answer". Either way the model's text is
-        # the response — show it.
-        if result.explanation:
-            console.print(result.explanation)
-            return
-        err.print("[yellow]I couldn't turn that into a query for this schema.[/yellow]")
-        raise typer.Exit(code=2)
-
-    console.print()
-    console.print(Syntax(result.sql, "sql", theme="ansi_dark", word_wrap=True))
-    if result.explanation:
-        console.print(f"[dim]{result.explanation}[/dim]")
-    if result.assumptions:
-        console.print("[bold]Assumptions:[/bold]")
-        for a in result.assumptions:
-            console.print(f"  - {a}")
-    console.print(f"[dim]Confidence:[/dim] {result.confidence.value}")
-
-    if dry_run:
-        console.print("[dim](--dry-run: query not executed)[/dim]")
         return
-
-    try:
-        safe_sql = validate_read_only_select(result.sql)
-    except UnsafeQueryError as exc:
-        err.print(f"[bold red]Refusing to run this query:[/bold red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    try:
-        with Database(settings.oracle) as db:
-            rows = db.query(with_row_limit(safe_sql, max_rows))
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]Query failed:[/bold red] {exc}")
-        hint = privilege_hint(safe_sql, str(exc))
-        if hint:
-            err.print(f"  [dim]{hint}[/dim]")
-        raise typer.Exit(code=1) from exc
-
-    _print_rows(rows, max_rows)
+    _interactive_ask(report, provider, settings, max_rows, dry_run)
 
 
 def _print_rows(rows: list[dict], max_rows: int) -> None:
@@ -288,19 +394,7 @@ def serve(
     if llm_provider:
         settings.llm.provider = llm_provider
 
-    if map_path is None:
-        map_path = Path(settings.output.dir) / f"{settings.output.name}.json"
-    if not map_path.exists():
-        err.print(
-            f"[bold red]No database map at[/bold red] {map_path}. "
-            "Run [cyan]blossa scan[/cyan] first, or point to one with [cyan]--map[/cyan]."
-        )
-        raise typer.Exit(code=1)
-    try:
-        report = ScanReport.model_validate_json(map_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]Could not read the map:[/bold red] {exc}")
-        raise typer.Exit(code=1) from exc
+    report = _load_map_report(settings, map_path)
 
     try:
         import uvicorn
@@ -318,6 +412,130 @@ def serve(
         f"at [cyan]http://{host}:{port}[/cyan]  [dim](Ctrl+C to stop)[/dim]"
     )
     uvicorn.run(create_app(settings, report), host=host, port=port, log_level="warning")
+
+
+def _print_simple_table(title: str, rows: list[dict]) -> None:
+    console.print(f"\n[bold]{title}[/bold]")
+    if not rows:
+        console.print("[dim]  (none)[/dim]")
+        return
+    table = Table(show_lines=False)
+    for col in rows[0]:
+        table.add_column(str(col), overflow="fold")
+    for r in rows:
+        table.add_row(*["" if v is None else str(v) for v in r.values()])
+    console.print(table)
+
+
+@app.command()
+def logs(
+    table: str | None = typer.Argument(
+        None, help="Log table to analyse (default: auto-pick the main error log)."
+    ),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Path to a config file."),
+    map_path: Path | None = typer.Option(
+        None, "--map", "-m", help="Scan JSON map to use (default: <out>/<name>.json)."
+    ),
+    llm_provider: str | None = typer.Option(None, "--llm-provider"),
+    limit: int = typer.Option(50, "--limit", help="How many recent entries to show / analyse."),
+    all_severities: bool = typer.Option(
+        False, "--all", help="Include non-error entries (default: errors/failures only)."
+    ),
+    explain: bool = typer.Option(
+        False, "--explain", help="Cluster recent errors into root causes (LOCAL model only)."
+    ),
+) -> None:
+    """Analyse an application log/error/audit table: breakdowns, recent entries, root causes.
+
+    The breakdowns and recent entries are plain read-only SQL — results are shown to you only.
+    `--explain` additionally sends the (PII-redacted) error text to the model to cluster root
+    causes; because that reads real row text, it is allowed only with a LOCAL model (e.g. Ollama),
+    where nothing leaves your machine.
+    """
+    settings = load_settings(config)
+    if llm_provider:
+        settings.llm.provider = llm_provider
+    report = _load_map_report(settings, map_path)
+
+    if not report.log_tables:
+        err.print(
+            "[yellow]No application log tables were recognised in this map.[/yellow] "
+            "Scan a schema that has error/audit/job-log tables first."
+        )
+        raise typer.Exit(code=1)
+
+    lt = choose_log_table(report.log_tables, table)
+    if lt is None:
+        known = ", ".join(x.table for x in report.log_tables)
+        err.print(f"[bold red]No log table named[/bold red] {table}. Known: {known}")
+        raise typer.Exit(code=1)
+
+    # Fail fast on the privacy gate before touching the database.
+    provider = None
+    if explain:
+        if settings.llm.provider == "heuristic":
+            err.print("[bold red]--explain needs a model provider[/bold red] (the offline "
+                      "heuristic can't read error text).")
+            raise typer.Exit(code=1)
+        if settings.llm.provider not in LOCAL_PROVIDERS:
+            err.print(f"[bold red]Refusing to send error text to a remote model.[/bold red]\n"
+                      f"  [dim]{local_only_message()}[/dim]")
+            raise typer.Exit(code=1)
+        _preflight_llm(settings)
+        provider = get_provider(settings.llm)
+
+    only_errors = not all_severities
+    console.print(f"[bold]{lt.table}[/bold] [dim]({lt.kind.value} log, {lt.confidence.value} "
+                  f"confidence)[/dim]")
+
+    try:
+        with Database(settings.oracle) as db:
+            if (sev_sql := severity_breakdown_sql(lt)) is not None:
+                _print_simple_table("By severity", db.query(sev_sql))
+            if (src_sql := source_breakdown_sql(lt, only_errors=only_errors)) is not None:
+                label = "Top sources (errors)" if only_errors else "Top sources"
+                _print_simple_table(label, db.query(src_sql))
+            recent_rows = db.query(recent_entries_sql(lt, limit=limit, only_errors=only_errors))
+            _print_simple_table(
+                "Most recent errors" if only_errors else "Most recent entries", recent_rows
+            )
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]Log query failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print("[dim]Results are shown to you only - not sent to the model.[/dim]")
+
+    if not explain:
+        return
+    if not recent_rows:
+        console.print("\n[dim]No error entries to explain.[/dim]")
+        return
+
+    _status("Clustering recent errors into root causes (local model) ...")
+    msg_col = lt.column_for(LogRole.MESSAGE)
+    redacted = redact_entries(recent_rows, msg_col)
+    try:
+        rc = run_root_cause(provider, lt.table, redacted)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"\n[bold]Root causes[/bold] [dim](from {rc.sample_size} redacted entries; "
+                  "text stayed on this machine)[/dim]")
+    if not rc.clusters:
+        console.print(f"[dim]{rc.note}[/dim]")
+        return
+    for c in rc.clusters:
+        head = f"[bold]{c.cause}[/bold]"
+        if c.count:
+            head += f"  [dim]x{c.count}[/dim]"
+        if c.severity:
+            head += f"  [dim]{c.severity}[/dim]"
+        console.print(f"\n{head}")
+        if c.suggested_action:
+            console.print(f"  -> {c.suggested_action}")
+        if c.example:
+            console.print(f"  [dim]e.g. {c.example}[/dim]")
 
 
 @app.command()

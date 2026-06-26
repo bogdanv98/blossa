@@ -14,6 +14,7 @@
       <button class="tab active" data-tab="ask">Ask</button>
       <button class="tab" data-tab="schema">Schema</button>
       <button class="tab" data-tab="logic">Logic</button>
+      <button class="tab" data-tab="logs">Logs</button>
     </nav>
   </header>
 
@@ -23,15 +24,20 @@
       <input id="question" type="text" autocomplete="off"
              placeholder="Ask in plain language, e.g. how many employees per department?" />
       <button type="submit" id="ask-btn">Ask</button>
+      <button type="button" id="new-thread-btn" class="ghost hidden" title="Forget the conversation and start over">New thread</button>
     </form>
     <p class="muted small">
-      The model sees only the schema map — never your data. The SQL below is what will run; you can
-      edit it. Queries are read-only; results are shown here only and never sent to the model.
+      The model sees only the schema map — never your data. Ask a follow-up to refine the last
+      query (e.g. “now break it down by year”). The SQL below is what will run; you can edit it.
+      Queries are read-only; results are shown here only and never sent to the model.
     </p>
+
+    <div id="thread"></div>
 
     <div id="ask-status" class="status"></div>
 
     <section id="answer" class="hidden">
+      <p id="current-question" class="current-question"></p>
       <div class="sql-head">
         <h3>SQL <span id="confidence" class="badge"></span></h3>
         <button id="run-btn" type="button">Run ▸</button>
@@ -67,6 +73,17 @@
       source by the model. Inferred; verify before relying on it.
     </p>
     <div id="programs"></div>
+  </main>
+
+  <!-- LOGS ------------------------------------------------------------------->
+  <main id="tab-logs" class="tab-panel">
+    <input id="logs-search" type="text" placeholder="Search log tables…" autocomplete="off" />
+    <p class="muted small">
+      Application log / error / audit tables — where the app records what happened to the business
+      data. Recognised from their name and column shape; each column is tagged with the role you'd
+      group, filter or sort on. Ask about errors in the <strong>Ask</strong> tab to query them.
+    </p>
+    <div id="logs"></div>
   </main>
 
   <script src="/static/app.js"></script>

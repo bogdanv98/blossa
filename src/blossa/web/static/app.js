@@ -316,6 +316,19 @@ function renderLogs(logs) {
     if (lt.evidence && lt.evidence.length)
       card.append(el("p", { class: "muted small", text: "Why: " + lt.evidence.join("; ") }));
 
+    const actions = el("div", { class: "log-actions" });
+
+    // Spike trend is deterministic (only counts leave the DB) → offered whenever there's a timestamp.
+    const hasTime = (lt.columns || []).some((c) => c.role === "event_time");
+    if (hasTime) {
+      const spikeOut = el("div", { class: "log-spikes" });
+      const sbtn = el("button", { class: "ghost", type: "button", text: "Show spikes" });
+      sbtn.addEventListener("click", () => showSpikes(lt.name, sbtn, spikeOut));
+      actions.append(sbtn);
+      card.append(actions);
+      card.append(spikeOut);
+    }
+
     // Root-cause explanation reads real error text → only offered for logs that have a message,
     // and the server still refuses unless the model is local. Results render inline.
     const hasMessage = (lt.columns || []).some((c) => c.role === "message");
@@ -323,11 +336,71 @@ function renderLogs(logs) {
       const out = el("div", { class: "log-causes" });
       const btn = el("button", { class: "ghost", type: "button", text: "Explain recent errors" });
       btn.addEventListener("click", () => explainLog(lt.name, btn, out));
-      card.append(el("div", { class: "log-actions" }, btn));
+      if (!hasTime) card.append(actions);
+      actions.append(btn);
       card.append(out);
     }
     box.append(card);
   });
+}
+
+async function showSpikes(name, btn, out) {
+  btn.disabled = true;
+  out.replaceChildren(el("p", { class: "muted small", text: "Charting error volume over time…" }));
+  try {
+    const res = await fetch("/api/logs/spikes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ table: name, grain: "hour" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Spike analysis failed.");
+    out.replaceChildren();
+    renderSpikes(out, data);
+  } catch (err) {
+    out.replaceChildren(el("p", { class: "status error small", text: err.message }));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderSpikes(out, data) {
+  const buckets = data.buckets || [];
+  if (!buckets.length) {
+    out.append(el("p", { class: "muted small", text: data.note || "No entries in this window." }));
+    return;
+  }
+  const spikeSet = new Set((data.spikes || []).map((s) => s.bucket));
+  const headText = (data.spikes && data.spikes.length)
+    ? `⚠ ${data.spikes.length} spike(s) — baseline ${data.baseline}/${data.grain}, flagged at ≥${data.factor}× and ≥${data.min_count}`
+    : `No spikes — baseline ${data.baseline}/${data.grain} across ${data.bucket_count} buckets`;
+  out.append(el("p", { class: (data.spikes && data.spikes.length) ? "spike-head small" : "muted small", text: headText }));
+
+  const peak = buckets.reduce((m, b) => Math.max(m, b.count), 1) || 1;
+  const chart = el("div", { class: "spike-chart" });
+  buckets.forEach((b) => {
+    const isSpike = spikeSet.has(b.bucket);
+    const row = el("div", { class: "spike-row" + (isSpike ? " is-spike" : "") });
+    row.append(el("span", { class: "spike-label", text: b.bucket }));
+    const barWrap = el("span", { class: "spike-bar-wrap" });
+    barWrap.append(el("span", { class: "spike-bar", style: `width:${Math.max(2, Math.round(100 * b.count / peak))}%` }));
+    row.append(barWrap);
+    row.append(el("span", { class: "spike-count", text: String(b.count) + (isSpike ? "  ⚠" : "") }));
+    chart.append(row);
+  });
+  out.append(chart);
+
+  if (data.onsets && data.onsets.length) {
+    out.append(el("p", { class: "muted small", text: "Sources that started spiking:" }));
+    const ul = el("ul", { class: "spike-onsets" });
+    data.onsets.forEach((o) =>
+      ul.append(el("li", { class: "small" },
+        el("code", { text: o.source || "(unattributed)" }),
+        el("span", { class: "muted", text: ` at ${o.bucket} — ${o.count} (${o.ratio}× baseline)` })
+      ))
+    );
+    out.append(ul);
+  }
 }
 
 async function explainLog(name, btn, out) {

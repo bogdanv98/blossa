@@ -133,7 +133,7 @@ blossa scan --demo --llm-provider heuristic
 | `blossa scan` | Full pipeline against the configured Oracle schema → Markdown + JSON. |
 | `blossa scan --demo` | Run against the bundled offline fixture (no Oracle needed). |
 | `blossa ask "<question>"` | Ask a plain-language question; grounds on the map, shows the SQL, runs it read-only. Omit the question for an interactive session where follow-ups refine the last query. |
-| `blossa logs [TABLE]` | Analyse an application log/error/audit table: severity/source breakdowns + recent entries; `--explain` clusters root causes (local model only). |
+| `blossa logs [TABLE]` | Analyse an application log/error/audit table: severity/source breakdowns + recent entries; `--spikes` charts volume over time and flags abnormal jumps (deterministic); `--explain` clusters root causes (local model only). |
 | `blossa serve` | Local web UI: browse the map + ask questions in a browser (needs `blossa[web]`). |
 | `blossa introspect` | Just dump the raw introspected schema as JSON (no checks, no LLM). |
 | `blossa check-llm` | Verify the configured LLM provider is reachable. |
@@ -206,8 +206,11 @@ most common errors this week?"_ or _"which module fails most?"_ produce the righ
 SQL.
 
 ```bash
-blossa logs                       # breakdowns (by severity, by source) + most recent errors
-blossa logs ERROR_LOG --explain   # + cluster the recent errors into root causes
+blossa logs                          # breakdowns (by severity, by source) + most recent errors
+blossa logs ERROR_LOG --explain      # + cluster the recent errors into root causes
+blossa logs --spikes                 # chart error volume over time and flag abnormal jumps
+blossa logs --spikes --by day --since 7d   # daily buckets, last week only
+blossa logs --spikes --explain       # + root-cause the biggest spike window specifically
 ```
 
 The breakdowns and recent entries are plain read-only SQL — **results are shown to you only**.
@@ -216,6 +219,14 @@ root causes with suggested actions. Because that means sending row text to the m
 **only with a LOCAL model** (e.g. Ollama), where nothing leaves your machine; with a remote provider it
 refuses. The message is also PII-redacted (emails, long card/account numbers) before it is sent, as
 defence-in-depth. In the web UI the same thing is an **Explain recent errors** button on each log card.
+
+`--spikes` is the **time-based** view: it buckets the log by hour (or `--by day`), compares each
+bucket against the median baseline, and flags the ones that tower over it (≥3× and ≥5 entries) — so
+_"errors started spiking at 02:00"_ jumps out, and it even names the **module that started spiking**
+and when. This stays fully deterministic: **only aggregate counts leave the database**, never row
+text, so it works offline and needs no model. Add `--explain` to then root-cause just the busiest
+spike window on a local model, and `--since 48h`/`7d` to limit the window. The web **Logs** tab has a
+matching **Show spikes** button that draws the same trend with the spike hours highlighted.
 
 ## Web UI (browse + ask in a browser)
 
@@ -229,7 +240,8 @@ blossa serve --llm-provider ollama        # → http://127.0.0.1:8000
 Four views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
 relationships, with search), **Logic** lists what each stored procedure/function/package/trigger/
 view does (plus the tables it touches), **Logs** shows the recognised application log/error/audit
-tables with each column's role (and an _Explain recent errors_ button), and **Ask** runs the
+tables with each column's role (plus _Show spikes_ to chart volume over time and _Explain recent
+errors_ to cluster root causes), and **Ask** runs the
 natural-language → SQL loop — you see the SQL (editable), the assumptions and confidence, then the
 results. The server binds to **localhost only** by default and keeps every boundary the CLI does:
 the model sees only the map (plus, for an explicit log explanation, PII-redacted error text on a

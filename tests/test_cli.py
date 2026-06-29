@@ -213,6 +213,35 @@ def test_logs_explain_refuses_heuristic(tmp_path):
     assert "model provider" in result.output
 
 
+class _SpikeDB:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def query(self, sql, binds=None):
+        if "AS SOURCE" in sql:
+            return [{"BUCKET": "2026-06-29 00:00", "SOURCE": "PAYMENT_GATEWAY.CHARGE",
+                     "ENTRIES": 18}]
+        rows = [{"BUCKET": f"2026-06-29 {h:02d}:00", "ENTRIES": 1} for h in range(1, 6)]
+        rows.append({"BUCKET": "2026-06-29 00:00", "ENTRIES": 19})
+        return rows
+
+
+def test_logs_spikes_flags_burst_deterministically(tmp_path, monkeypatch):
+    mp = _applog_map(tmp_path)
+    import blossa.cli as climod
+
+    monkeypatch.setattr(climod, "Database", lambda cfg: _SpikeDB())
+    result = runner.invoke(app, ["logs", "--map", str(mp), "--spikes"])
+    assert result.exit_code == 0, result.output
+    assert "SPIKE" in result.output  # the burst hour is flagged
+    assert "PAYMENT_GATEWAY.CHARGE" in result.output  # named as the spiking source
+    # No model needed and no error text touched — purely aggregate counts.
+    assert "no row text" in result.output
+
+
 def test_ask_without_map_errors(tmp_path):
     missing = tmp_path / "nope.json"
     result = runner.invoke(

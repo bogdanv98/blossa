@@ -195,6 +195,48 @@ def test_explain_log_clusters_with_local_provider():
     assert data["clusters"][0]["cause"] == "Gateway timeout"
 
 
+class _SpikeDB:
+    """A DB whose counts show a steady baseline plus one burst hour, for the spikes endpoint."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def query(self, sql, binds=None):
+        if "AS SOURCE" in sql:
+            return [{"BUCKET": "2026-06-29 00:00", "SOURCE": "PAYMENT_GATEWAY.CHARGE",
+                     "ENTRIES": 18}]
+        rows = [{"BUCKET": f"2026-06-29 {h:02d}:00", "ENTRIES": 1} for h in range(1, 6)]
+        rows.append({"BUCKET": "2026-06-29 00:00", "ENTRIES": 19})
+        return rows
+
+
+def test_log_spikes_endpoint_flags_burst_and_source():
+    # Deterministic — only aggregate counts, so it runs even on the heuristic provider.
+    settings = Settings()
+    settings.llm.provider = "heuristic"
+    app = create_app(
+        settings, _log_report(), provider=_FakeProvider(), db_factory=lambda: _SpikeDB()
+    )
+    r = TestClient(app).post("/api/logs/spikes", json={"table": "ERROR_LOG", "grain": "hour"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["baseline"] == 1.0
+    assert [s["bucket"] for s in data["spikes"]] == ["2026-06-29 00:00"]
+    assert data["onsets"][0]["source"] == "PAYMENT_GATEWAY.CHARGE"
+
+
+def test_log_spikes_endpoint_rejects_bad_grain():
+    settings = Settings()
+    app = create_app(
+        settings, _log_report(), provider=_FakeProvider(), db_factory=lambda: _SpikeDB()
+    )
+    r = TestClient(app).post("/api/logs/spikes", json={"table": "ERROR_LOG", "grain": "week"})
+    assert r.status_code == 400
+
+
 def test_index_page_served():
     r = _client().get("/")
     assert r.status_code == 200

@@ -138,8 +138,20 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .log-role-name { color: var(--muted); text-transform: capitalize; }
 .log-role code { font-size: 13px; }
-.log-actions { margin-top: 12px; }
+.log-actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
 .log-causes { margin-top: 10px; }
+.log-spikes { margin-top: 10px; }
+.spike-head { color: var(--low); font-weight: 600; }
+.spike-chart { display: flex; flex-direction: column; gap: 3px; margin: 8px 0; }
+.spike-row { display: grid; grid-template-columns: 130px 1fr 56px; align-items: center; gap: 8px; }
+.spike-label { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.spike-bar-wrap { background: var(--line); border-radius: 4px; height: 12px; overflow: hidden; }
+.spike-bar { display: block; height: 100%; background: var(--medium); border-radius: 4px; }
+.spike-row.is-spike .spike-bar { background: var(--low); }
+.spike-row.is-spike .spike-count { color: var(--low); font-weight: 600; }
+.spike-count { font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+.spike-onsets { margin: 4px 0 0; padding-left: 18px; }
+.spike-onsets li { margin: 2px 0; }
 .cause { border-left: 3px solid var(--line); padding: 2px 0 2px 12px; margin: 10px 0; }
 .cause-head { margin: 0 0 2px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cause p { margin: 2px 0; }

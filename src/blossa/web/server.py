@@ -32,11 +32,16 @@ from ..llm import get_provider
 from ..llm.base import LLMProvider
 from ..logsense import (
     LOCAL_PROVIDERS,
+    TIME_GRAINS,
+    build_spike_report,
     choose_log_table,
     local_only_message,
+    parse_since,
     recent_entries_sql,
     redact_entries,
     run_root_cause,
+    source_time_bucket_sql,
+    time_bucket_sql,
 )
 from ..models import LogRole, ScanReport
 from ..nlquery import (
@@ -171,6 +176,13 @@ class ExplainLogBody(BaseModel):
     limit: int = 50
 
 
+class SpikesBody(BaseModel):
+    table: str | None = None  # which log table; None = auto-pick the main error log
+    grain: str = "hour"  # hour | day
+    since: str | None = None  # e.g. "48h" / "7d"; None = whole history
+    only_errors: bool = True
+
+
 def create_app(
     settings: Settings,
     report: ScanReport,
@@ -263,6 +275,34 @@ def create_app(
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
         return rc.model_dump()
+
+    @app.post("/api/logs/spikes")
+    def post_log_spikes(body: SpikesBody) -> dict:
+        # Deterministic time-trend: only aggregate counts leave the DB, so no provider gate needed.
+        lt = choose_log_table(report.log_tables, body.table)
+        if lt is None:
+            raise HTTPException(status_code=404, detail="No matching log table in this map.")
+        grain = (body.grain or "hour").lower().strip()
+        if grain not in TIME_GRAINS:
+            raise HTTPException(status_code=400,
+                                detail=f"grain must be one of {', '.join(TIME_GRAINS)}.")
+        since_hours = parse_since(body.since)
+        bucket_sql = time_bucket_sql(lt, grain=grain, only_errors=body.only_errors,
+                                     since_hours=since_hours)
+        if bucket_sql is None:
+            raise HTTPException(status_code=400,
+                                detail="This log has no timestamp column to chart over time.")
+        src_sql = source_time_bucket_sql(lt, grain=grain, only_errors=body.only_errors,
+                                         since_hours=since_hours)
+        try:
+            with make_db() as db:
+                bucket_rows = db.query(bucket_sql)
+                source_rows = db.query(src_sql) if src_sql is not None else []
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Log query failed: {exc}") from exc
+        report_obj = build_spike_report(lt, bucket_rows, source_rows, grain=grain,
+                                        only_errors=body.only_errors)
+        return report_obj.model_dump()
 
     @app.get("/")
     def index() -> FileResponse:

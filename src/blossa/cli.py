@@ -25,13 +25,19 @@ from .grants import build_grants_sql
 from .llm import get_provider
 from .logsense import (
     LOCAL_PROVIDERS,
+    TIME_GRAINS,
+    bucket_entries_sql,
+    build_spike_report,
     choose_log_table,
     local_only_message,
+    parse_since,
     recent_entries_sql,
     redact_entries,
     run_root_cause,
     severity_breakdown_sql,
     source_breakdown_sql,
+    source_time_bucket_sql,
+    time_bucket_sql,
 )
 from .models import LogRole, ScanReport
 from .nlquery import (
@@ -427,6 +433,75 @@ def _print_simple_table(title: str, rows: list[dict]) -> None:
     console.print(table)
 
 
+def _print_spike_report(report) -> None:  # noqa: ANN001 - SpikeReport, kept loose to avoid import
+    """ASCII-only render of the time trend + flagged spikes (Windows console safe)."""
+    window = "errors only" if report.only_errors else "all entries"
+    console.print(f"\n[bold]Volume by {report.grain}[/bold] [dim]({window}; baseline "
+                  f"{report.baseline:g}/bucket, spike = >={report.factor:g}x and "
+                  f">={report.min_count})[/dim]")
+    if not report.buckets:
+        console.print(f"[dim]  {report.note}[/dim]")
+        return
+
+    peak = max((b.count for b in report.buckets), default=1) or 1
+    spike_buckets = {s.bucket for s in report.spikes}
+    table = Table(show_lines=False)
+    table.add_column("bucket")
+    table.add_column("count", justify="right")
+    table.add_column("")
+    table.add_column("")
+    for b in report.buckets:
+        bar = "#" * max(1, round(20 * b.count / peak)) if b.count else ""
+        flag = "[bold red]SPIKE[/bold red]" if b.bucket in spike_buckets else ""
+        style = "bold red" if b.bucket in spike_buckets else None
+        table.add_row(b.bucket, str(b.count), bar, flag, style=style)
+    console.print(table)
+
+    if report.spikes:
+        console.print(f"\n[bold red]{len(report.spikes)} spike(s) detected[/bold red] "
+                      f"[dim](peak {max(s.count for s in report.spikes)} vs baseline "
+                      f"{report.baseline:g})[/dim]")
+    else:
+        console.print(f"[dim]{report.note}[/dim]")
+
+    if report.onsets:
+        console.print("\n[bold]Sources that started spiking[/bold]")
+        for o in report.onsets:
+            name = o.source or "(unattributed)"
+            console.print(f"  {name}  [dim]at {o.bucket} ({o.count}, {o.ratio:g}x baseline)[/dim]")
+
+
+def _explain_entries(provider, lt, rows: list[dict], *, header: str) -> None:  # noqa: ANN001
+    """Redact, cluster into root causes via the local model, and print them (ASCII only)."""
+    if not rows:
+        console.print("\n[dim]No matching error entries to explain.[/dim]")
+        return
+    msg_col = lt.column_for(LogRole.MESSAGE)
+    redacted = redact_entries(rows, msg_col)
+    try:
+        rc = run_root_cause(provider, lt.table, redacted)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"\n[bold]{header}[/bold] [dim](from {rc.sample_size} redacted entries; "
+                  "text stayed on this machine)[/dim]")
+    if not rc.clusters:
+        console.print(f"[dim]{rc.note}[/dim]")
+        return
+    for c in rc.clusters:
+        head = f"[bold]{c.cause}[/bold]"
+        if c.count:
+            head += f"  [dim]x{c.count}[/dim]"
+        if c.severity:
+            head += f"  [dim]{c.severity}[/dim]"
+        console.print(f"\n{head}")
+        if c.suggested_action:
+            console.print(f"  -> {c.suggested_action}")
+        if c.example:
+            console.print(f"  [dim]e.g. {c.example}[/dim]")
+
+
 @app.command()
 def logs(
     table: str | None = typer.Argument(
@@ -441,6 +516,15 @@ def logs(
     all_severities: bool = typer.Option(
         False, "--all", help="Include non-error entries (default: errors/failures only)."
     ),
+    spikes: bool = typer.Option(
+        False, "--spikes", help="Show error volume over time and flag spikes (deterministic)."
+    ),
+    by: str = typer.Option(
+        "hour", "--by", help="Time bucket for --spikes: hour or day."
+    ),
+    since: str | None = typer.Option(
+        None, "--since", help="Limit --spikes to a recent window, e.g. 48h or 7d."
+    ),
     explain: bool = typer.Option(
         False, "--explain", help="Cluster recent errors into root causes (LOCAL model only)."
     ),
@@ -448,9 +532,11 @@ def logs(
     """Analyse an application log/error/audit table: breakdowns, recent entries, root causes.
 
     The breakdowns and recent entries are plain read-only SQL — results are shown to you only.
-    `--explain` additionally sends the (PII-redacted) error text to the model to cluster root
-    causes; because that reads real row text, it is allowed only with a LOCAL model (e.g. Ollama),
-    where nothing leaves your machine.
+    `--spikes` charts error volume over time buckets and flags abnormal jumps (also deterministic —
+    only aggregate counts leave the database). `--explain` additionally sends the (PII-redacted)
+    error text to the model to cluster root causes; because that reads real row text, it is allowed
+    only with a LOCAL model (e.g. Ollama), where nothing leaves your machine. Combine
+    `--spikes --explain` to root-cause the biggest spike window specifically.
     """
     settings = load_settings(config)
     if llm_provider:
@@ -488,6 +574,49 @@ def logs(
     console.print(f"[bold]{lt.table}[/bold] [dim]({lt.kind.value} log, {lt.confidence.value} "
                   f"confidence)[/dim]")
 
+    if spikes:
+        grain = by.lower().strip()
+        if grain not in TIME_GRAINS:
+            err.print(f"[bold red]--by must be one of {', '.join(TIME_GRAINS)}[/bold red].")
+            raise typer.Exit(code=1)
+        since_hours = parse_since(since)
+        bucket_sql = time_bucket_sql(lt, grain=grain, only_errors=only_errors,
+                                     since_hours=since_hours)
+        if bucket_sql is None:
+            err.print("[yellow]This log has no timestamp column, so it can't be charted over "
+                      "time.[/yellow]")
+            raise typer.Exit(code=1)
+        src_sql = source_time_bucket_sql(lt, grain=grain, only_errors=only_errors,
+                                         since_hours=since_hours)
+        try:
+            with Database(settings.oracle) as db:
+                bucket_rows = db.query(bucket_sql)
+                source_rows = db.query(src_sql) if src_sql is not None else []
+        except Exception as exc:  # noqa: BLE001
+            err.print(f"[bold red]Log query failed:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        report = build_spike_report(lt, bucket_rows, source_rows, grain=grain,
+                                    only_errors=only_errors)
+        _print_spike_report(report)
+        console.print("[dim]Only aggregate counts left the database - no row text.[/dim]")
+
+        if not explain or not report.spikes:
+            return
+        # --explain: root-cause the biggest spike window (local model only, gate already passed).
+        top = max(report.spikes, key=lambda s: s.count)
+        _status(f"Clustering errors in the spike at {top.bucket} (local model) ...")
+        win_sql = bucket_entries_sql(lt, top.bucket, grain=grain, limit=limit,
+                                     only_errors=only_errors)
+        try:
+            with Database(settings.oracle) as db:
+                win_rows = db.query(win_sql)
+        except Exception as exc:  # noqa: BLE001
+            err.print(f"[bold red]Log query failed:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+        _explain_entries(provider, lt, win_rows, header=f"Root causes in the {top.bucket} spike")
+        return
+
     try:
         with Database(settings.oracle) as db:
             if (sev_sql := severity_breakdown_sql(lt)) is not None:
@@ -507,35 +636,8 @@ def logs(
 
     if not explain:
         return
-    if not recent_rows:
-        console.print("\n[dim]No error entries to explain.[/dim]")
-        return
-
     _status("Clustering recent errors into root causes (local model) ...")
-    msg_col = lt.column_for(LogRole.MESSAGE)
-    redacted = redact_entries(recent_rows, msg_col)
-    try:
-        rc = run_root_cause(provider, lt.table, redacted)
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    console.print(f"\n[bold]Root causes[/bold] [dim](from {rc.sample_size} redacted entries; "
-                  "text stayed on this machine)[/dim]")
-    if not rc.clusters:
-        console.print(f"[dim]{rc.note}[/dim]")
-        return
-    for c in rc.clusters:
-        head = f"[bold]{c.cause}[/bold]"
-        if c.count:
-            head += f"  [dim]x{c.count}[/dim]"
-        if c.severity:
-            head += f"  [dim]{c.severity}[/dim]"
-        console.print(f"\n{head}")
-        if c.suggested_action:
-            console.print(f"  -> {c.suggested_action}")
-        if c.example:
-            console.print(f"  [dim]e.g. {c.example}[/dim]")
+    _explain_entries(provider, lt, recent_rows, header="Root causes")
 
 
 @app.command()

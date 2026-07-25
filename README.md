@@ -109,6 +109,18 @@ Prefer the env var for the password:
 export BLOSSA_ORACLE__PASSWORD=blossa_demo
 ```
 
+Set `llm.language` if your team doesn't read English — the map (table purposes, column meanings,
+program summaries) is then **written** in that language, while table names, columns and SQL stay
+exactly as they are in the database:
+
+```yaml
+llm:
+  provider: ollama
+  language: ro     # default "en"; applies to the NEXT scan, existing maps keep their language
+```
+
+`ask` is separate: it answers in whatever language the question was asked in, whatever the map says.
+
 ### 3. Scan
 
 ```bash
@@ -228,6 +240,23 @@ text, so it works offline and needs no model. Add `--explain` to then root-cause
 spike window on a local model, and `--since 48h`/`7d` to limit the window. The web **Logs** tab has a
 matching **Show spikes** button that draws the same trend with the spike hours highlighted.
 
+## Ask it to write the code
+
+The same box also builds things. Ask for a *procedure, view, trigger or index* — _"write me a
+procedure like get_balance but only for active accounts"_ — and Blossa returns the code instead of
+a query. The map is what makes it fit: it carries the real table and column names **and the source
+of the existing programs**, so the result follows the conventions already in your schema (the same
+error codes, the same logging call) rather than generic textbook PL/SQL.
+
+**Blossa never runs what it writes.** The code is shown for you to review and run with your own
+tool; the connection stays READ ONLY at the Oracle transaction level, so it cannot do otherwise.
+Two deterministic checks run over every result and are reported next to it:
+
+- names that appear nowhere in the map (a model asked about "active accounts" will happily invent
+  `ACTIVE = 'Y'` when your schema keeps `STATUS = 'ACTIVE'`);
+- destructive statements (`DROP`, `TRUNCATE`, an unscoped `DELETE`), and routine bodies that are
+  written to live inside a package and would not compile on their own.
+
 ## Web UI (browse + ask in a browser)
 
 For a non-technical analyst, the same thing is available as a small local web app:
@@ -237,11 +266,16 @@ pip install "blossa[web]"
 blossa serve --llm-provider ollama        # → http://127.0.0.1:8000
 ```
 
-Four views: **Schema** browses the map (tables → columns with inferred meanings, types, keys and
-relationships, with search), **Logic** lists what each stored procedure/function/package/trigger/
-view does (plus the tables it touches), **Logs** shows the recognised application log/error/audit
-tables with each column's role (plus _Show spikes_ to chart volume over time and _Explain recent
-errors_ to cluster root causes), and **Ask** runs the
+Five views. **SQL** is the workspace: an object browser on the left — tables, views, packages,
+procedures, functions, triggers, materialized views, sequences, synonyms, types and indexes — next
+to a SQL editor and a sortable, CSV-exportable result grid, with an _Ask AI_ bar that writes the
+query for you. Click any object for its **DDL**: Oracle's own `DBMS_METADATA` text when your account
+may read it, otherwise a `CREATE TABLE` rebuilt from the scanned map (labelled as such), plus the
+captured source for views and PL/SQL. **Schema** browses the map (tables → columns with inferred
+meanings, types, keys and relationships, with search), **Logic** lists what each stored
+procedure/function/package/trigger/view does (plus the tables it touches), **Logs** shows the
+recognised application log/error/audit tables with each column's role (plus _Show spikes_ to chart
+volume over time and _Explain recent errors_ to cluster root causes), and **Ask** runs the
 natural-language → SQL loop — you see the SQL (editable), the assumptions and confidence, then the
 results. The server binds to **localhost only** by default and keeps every boundary the CLI does:
 the model sees only the map (plus, for an explicit log explanation, PII-redacted error text on a

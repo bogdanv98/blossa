@@ -18,12 +18,51 @@ low-confidence result rather than aborting the scan.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 
-from .llm.base import LLMProvider
-from .models import ConfidenceLevel, ProgramSemantics, ProgramUnit
+from .llm.base import LLMProvider, language_instruction
+from .models import ConfidenceLevel, ProgramKind, ProgramSemantics, ProgramUnit
 
 ProgressFn = Callable[[str, int, int], None]
+
+_SUBPROGRAM_RE = re.compile(
+    r"^\s*(PROCEDURE|FUNCTION)\s+([A-Za-z][A-Za-z0-9_$#]*)", re.IGNORECASE | re.MULTILINE
+)
+_PACKAGE_BODY_RE = re.compile(r"\bPACKAGE\s+BODY\b", re.IGNORECASE)
+
+
+def declared_subprograms(source: str) -> list[tuple[str, ProgramKind]]:
+    """The routines a package DECLARES, as (NAME, PROCEDURE|FUNCTION), read out of its spec.
+
+    A packaged subprogram is not a database object of its own — `CORE_BANKING.get_balance` never
+    appears in ALL_OBJECTS, only its package does. Reading the spec is therefore the only way the
+    map can know the callable exists, and without it a question like "is there a get_balance
+    procedure?" can only be answered with a catalog query that is structurally unable to find one.
+
+    Only the spec is scanned (the part before PACKAGE BODY), so package-private helpers — which a
+    caller cannot invoke — are left out. Overloads collapse to one entry.
+    """
+    spec = _PACKAGE_BODY_RE.split(source or "", maxsplit=1)[0]
+    found: list[tuple[str, ProgramKind]] = []
+    seen: set[str] = set()
+    for match in _SUBPROGRAM_RE.finditer(spec):
+        name = match.group(2).upper()
+        if name in seen:
+            continue
+        seen.add(name)
+        kind = (
+            ProgramKind.FUNCTION
+            if match.group(1).upper() == "FUNCTION"
+            else ProgramKind.PROCEDURE
+        )
+        found.append((name, kind))
+    return found
+
+
+def package_subprograms(source: str) -> list[str]:
+    """Just the names from `declared_subprograms`, in declaration order."""
+    return [name for name, _ in declared_subprograms(source)]
 
 # Cap how much source we send per unit. Enough for the logic of normal app code; keeps the prompt
 # bounded for a pathological generated/wrapped unit. The model is told when it was truncated.
@@ -64,7 +103,9 @@ def trim_source(source: str) -> str:
     return s[:_MAX_SOURCE_CHARS] + "\n-- … source truncated for length …"
 
 
-def build_program_prompt(unit: ProgramUnit, known_tables: list[str] | None = None) -> str:
+def build_program_prompt(
+    unit: ProgramUnit, known_tables: list[str] | None = None, language: str | None = None
+) -> str:
     payload = {
         "name": unit.name,
         "owner": unit.owner,
@@ -80,7 +121,7 @@ def build_program_prompt(unit: ProgramUnit, known_tables: list[str] | None = Non
     return (
         f"Program unit source (DDL/metadata, not row data):\n"
         f"{json.dumps(payload, indent=2, default=str)}\n\n"
-        f"{tables_hint}{_OUTPUT_CONTRACT}"
+        f"{tables_hint}{language_instruction(language)}{_OUTPUT_CONTRACT}"
     )
 
 
@@ -111,7 +152,8 @@ def run_program_pass(
         if progress:
             progress(unit.name, i, total)
         try:
-            raw = provider.generate(PROGRAM_SYSTEM_PROMPT, build_program_prompt(unit, known_tables))
+            prompt = build_program_prompt(unit, known_tables, getattr(provider, "language", "en"))
+            raw = provider.generate(PROGRAM_SYSTEM_PROMPT, prompt)
             results.append(parse_program_response(unit, raw))
         except Exception as exc:  # noqa: BLE001 - one unit's failure must not kill the scan
             results.append(_fallback(unit, f"{type(exc).__name__}: {exc}"))

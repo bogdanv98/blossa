@@ -19,9 +19,10 @@ from .base import SYSTEM_PROMPT, LLMProvider, build_user_prompt, parse_response
 class OllamaProvider(LLMProvider):
     name = "ollama"
 
-    def __init__(self, config: OllamaConfig):
+    def __init__(self, config: OllamaConfig, language: str = "en"):
         self._config = config
         self.model = config.model
+        self.language = language
 
     def available(self) -> bool:
         try:
@@ -48,7 +49,7 @@ class OllamaProvider(LLMProvider):
         return resp.json().get("message", {}).get("content", "")
 
     def analyze(self, summary: TableSummary) -> TableSemantics:
-        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary))
+        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary, self.language))
         return parse_response(summary, content)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
@@ -58,9 +59,10 @@ class OllamaProvider(LLMProvider):
 class OpenAICompatibleProvider(LLMProvider):
     name = "openai_compatible"
 
-    def __init__(self, config: OpenAICompatibleConfig):
+    def __init__(self, config: OpenAICompatibleConfig, language: str = "en"):
         self._config = config
         self.model = config.model
+        self.language = language
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -97,7 +99,7 @@ class OpenAICompatibleProvider(LLMProvider):
         return resp.json()["choices"][0]["message"]["content"]
 
     def analyze(self, summary: TableSummary) -> TableSemantics:
-        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary))
+        content = self._post_chat(SYSTEM_PROMPT, build_user_prompt(summary, self.language))
         return parse_response(summary, content)
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:

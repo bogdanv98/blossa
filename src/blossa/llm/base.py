@@ -34,6 +34,34 @@ SYSTEM_PROMPT = (
     "- Respond with STRICT JSON only, no prose, no markdown fences."
 )
 
+# The map is read by people, so it should be written in their language — but only the PROSE.
+# Names, identifiers and SQL are the schema's own vocabulary and must survive verbatim, or the
+# map stops matching the database it describes.
+_LANGUAGE_NAMES = {
+    "ro": "Romanian (romana)",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "pt": "Portuguese",
+}
+
+
+def language_instruction(language: str | None) -> str:
+    """An explicit "write the prose in X" line, or "" for English (the prompts' own language)."""
+    code = (language or "").strip().lower()
+    if not code or code in {"en", "english"}:
+        return ""
+    name = _LANGUAGE_NAMES.get(code, (language or "").strip())
+    return (
+        f"Write every text you produce (purpose, meaning, summary, evidence) in {name}. "
+        "Do NOT translate table names, column names, SQL or any other identifier — copy them "
+        "exactly as they appear.\n\n"
+    )
+
+
 _OUTPUT_CONTRACT = (
     'Respond with JSON of exactly this shape:\n'
     '{\n'
@@ -53,6 +81,8 @@ class LLMProvider(ABC):
 
     name: str = "abstract"
     model: str | None = None
+    # Language the provider writes its inferences in; set from llm.language at construction.
+    language: str = "en"
 
     @abstractmethod
     def analyze(self, summary: TableSummary) -> TableSemantics:
@@ -77,7 +107,7 @@ class LLMProvider(ABC):
 # --------------------------------------------------------- prompt construction
 
 
-def build_user_prompt(summary: TableSummary) -> str:
+def build_user_prompt(summary: TableSummary, language: str | None = None) -> str:
     """Render a compact, PII-safe JSON view of the table for the model."""
     payload = {
         "table": summary.name,
@@ -111,6 +141,7 @@ def build_user_prompt(summary: TableSummary) -> str:
     }
     return (
         f"Table summary (PII-safe JSON):\n{json.dumps(payload, indent=2, default=str)}\n\n"
+        f"{language_instruction(language)}"
         f"{_OUTPUT_CONTRACT}"
     )
 

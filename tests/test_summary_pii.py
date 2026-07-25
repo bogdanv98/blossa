@@ -45,3 +45,17 @@ def test_summary_keeps_key_roles_and_references():
     cust_col = next(c for c in orders.columns if c.name == "CUST_ID")
     assert cust_col.key_role.value == "foreign_key"
     assert cust_col.references == "CUSTOMERS.CUST_ID"
+
+
+def test_table_prompt_carries_the_configured_language():
+    from blossa.config import LLMConfig
+    from blossa.llm import get_provider
+
+    schema = build_demo_schema()
+    relationships, _ = run_checks(schema)
+    summary = build_summaries(schema, relationships)[0]
+    assert "Romanian" in build_user_prompt(summary, "ro")
+    assert "Romanian" not in build_user_prompt(summary)
+    # The setting reaches the provider, which is what actually builds the prompt during a scan.
+    provider = get_provider(LLMConfig(provider="ollama", language="ro"))
+    assert provider.language == "ro"

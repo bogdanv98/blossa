@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import typer
@@ -15,6 +16,12 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from . import __version__
+from .codegen import (
+    CODEGEN_SYSTEM_PROMPT,
+    build_codegen_prompt,
+    is_code_request,
+    parse_codegen_response,
+)
 from .config import Settings, load_settings
 from .db.connection import Database
 from .db.introspect import introspect_schema
@@ -45,6 +52,7 @@ from .nlquery import (
     AskResult,
     Turn,
     UnsafeQueryError,
+    answer_program_lookup,
     build_ask_prompt,
     enforce_error_severity_filter,
     parse_ask_response,
@@ -67,6 +75,23 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+def _tolerate_unprintable_characters() -> None:
+    """Never let a character the console can't encode kill a command.
+
+    A legacy Windows console is cp1252, which has no Romanian diacritics (and no arrows). Since
+    both the model's answers and our own Romanian text can contain them, printing would otherwise
+    raise UnicodeEncodeError mid-command. Degrading those few characters to a placeholder is
+    always better than losing the output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):  # not a reconfigurable text stream (e.g. captured)
+            pass
+
+
+_tolerate_unprintable_characters()
 console = Console()
 err = Console(stderr=True)
 
@@ -218,6 +243,60 @@ def _print_proposal(result: AskResult) -> None:
     console.print(f"[dim]Confidence:[/dim] {result.confidence.value}")
 
 
+def _write_code(
+    question: str,
+    report: ScanReport,
+    provider,
+    settings: Settings,
+    *,
+    history: list[Turn],
+    strict: bool,
+) -> AskResult | None:
+    """Generate Oracle code for the request and print it. Blossa never runs what it writes.
+
+    Returned as an AskResult with an empty `sql` so the caller's conversation bookkeeping — and
+    the read-only guarantee — stay exactly as they are: there is nothing here to execute.
+    """
+    _status("Writing the code ...")
+    prompt = build_codegen_prompt(
+        question,
+        report,
+        language=settings.llm.language,
+        history_text=" ".join(t.question for t in history),
+    )
+    try:
+        raw = provider.generate(CODEGEN_SYSTEM_PROMPT, prompt)
+    except Exception as exc:  # noqa: BLE001
+        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+        if strict:
+            raise typer.Exit(code=1) from exc
+        return None
+    proposal = parse_codegen_response(raw, report)
+    if not proposal.answerable:
+        err.print("[yellow]The model produced no code for that request.[/yellow]")
+        if proposal.explanation:
+            console.print(proposal.explanation)
+        if strict:
+            raise typer.Exit(code=2)
+        return AskResult(explanation=proposal.explanation)
+
+    label = " ".join(p for p in (proposal.object_type, proposal.object_name) if p)
+    console.print(f"\n[bold]{label or 'Generated code'}[/bold]")
+    console.print(Syntax(proposal.code, "sql", theme="ansi_dark", word_wrap=True))
+    console.print("[yellow]Not executed.[/yellow] Blossa only writes this - review it and run "
+                  "it yourself.")
+    if proposal.explanation:
+        console.print(proposal.explanation)
+    for warning in proposal.warnings:
+        console.print(f"[bold yellow]![/bold yellow] {warning}")
+    if proposal.assumptions:
+        console.print("[dim]Assumptions:[/dim]")
+        for assumption in proposal.assumptions:
+            console.print(f"  - {assumption}")
+    console.print(f"[dim]Confidence:[/dim] {proposal.confidence.value}")
+    return AskResult(explanation=proposal.explanation, confidence=proposal.confidence)
+
+
 def _answer_ask_turn(
     question: str,
     report: ScanReport,
@@ -236,6 +315,15 @@ def _answer_ask_turn(
     exits with meaningful codes; interactive mode passes strict=False so the session continues.
     Returns the proposal (whatever the model produced), or None if the model call itself failed.
     """
+    # "Write me a procedure like get_balance" asks Blossa to BUILD something: the answer is code,
+    # not a query, and it is printed for review — never executed.
+    if is_code_request(question):
+        return _write_code(question, report, provider, settings, history=history, strict=strict)
+    # Some questions the map already answers ("is there a get_balance procedure?"). Answering them
+    # here is deterministic, instant, and avoids a catalog query that could not find the routine.
+    known = answer_program_lookup(question, report)
+    if known is not None:
+        return known
     _status("Translating your question to SQL ...")
     try:
         prompt = build_ask_prompt(

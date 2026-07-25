@@ -26,8 +26,22 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ..codegen import (
+    CODEGEN_SYSTEM_PROMPT,
+    build_codegen_prompt,
+    is_code_request,
+    parse_codegen_response,
+)
 from ..config import Settings
 from ..db.connection import Database
+from ..ddl import (
+    GET_DDL_SQL,
+    clob_text,
+    metadata_type,
+    offline_ddl,
+    split_qualified,
+    validate_identifier,
+)
 from ..llm import get_provider
 from ..llm.base import LLMProvider
 from ..logsense import (
@@ -43,11 +57,12 @@ from ..logsense import (
     source_time_bucket_sql,
     time_bucket_sql,
 )
-from ..models import LogRole, ScanReport
+from ..models import LogRole, ProgramKind, ScanReport
 from ..nlquery import (
     ASK_SYSTEM_PROMPT,
     Turn,
     UnsafeQueryError,
+    answer_program_lookup,
     build_ask_prompt,
     enforce_error_severity_filter,
     parse_ask_response,
@@ -55,8 +70,13 @@ from ..nlquery import (
     validate_read_only_select,
     with_row_limit,
 )
+from ..program import package_subprograms
 
 _STATIC_DIR = Path(__file__).parent / "static"
+
+# Object types the map already describes in detail (tables + program units), so the browser's
+# catch-all "other objects" list doesn't duplicate them.
+_RICH_OBJECT_TYPES = {"TABLE", "VIEW", "PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER"}
 
 
 def _distinct_owners(report: ScanReport) -> list[str]:
@@ -65,6 +85,12 @@ def _distinct_owners(report: ScanReport) -> list[str]:
         if t.owner and t.owner not in owners:
             owners.append(t.owner)
     return owners
+
+
+def _default_owner(report: ScanReport) -> str | None:
+    """The owner to assume when the UI sends a bare object name (single-schema maps)."""
+    owners = _distinct_owners(report)
+    return owners[0] if len(owners) == 1 else None
 
 
 def build_map_view(report: ScanReport) -> dict:
@@ -124,16 +150,40 @@ def build_map_view(report: ScanReport) -> dict:
             }
         )
 
+    # Object browser list: the authoritative set is the captured program_units (present even when
+    # the scan ran without a model), each carrying its source/DDL. We left-join the LLM's summary
+    # from program_semantics when one exists, so the tree can show every view/package/proc/etc.
+    prog_sem = {(ps.owner, ps.name, ps.kind): ps for ps in report.program_semantics}
+    obj_status = {
+        ((o.owner or "").upper(), o.name.upper(), o.type.upper()): o.status
+        for o in report.schema_info.objects
+    }
     programs = [
         {
-            "name": q(p.name, p.owner),
-            "owner": p.owner,
-            "kind": p.kind.value,
-            "summary": p.summary,
-            "tables_used": p.tables_used,
-            "confidence": p.confidence.value,
+            "name": q(u.name, u.owner),
+            "owner": u.owner,
+            "kind": u.kind.value,
+            "summary": ps.summary if ps else "",
+            "tables_used": ps.tables_used if ps else [],
+            "confidence": ps.confidence.value if ps else "",
+            "source": u.source or "",
+            # VALID/INVALID from the catalog — an invalid package is worth seeing in the tree.
+            "status": obj_status.get(((u.owner or "").upper(), u.name.upper(), u.kind.value), ""),
+            # What a package declares: these routines exist only inside it, never in the catalog.
+            "subprograms": (
+                package_subprograms(u.source) if u.kind == ProgramKind.PACKAGE else []
+            ),
         }
-        for p in report.program_semantics
+        for u in report.schema_info.program_units
+        for ps in [prog_sem.get((u.owner, u.name, u.kind))]
+    ]
+
+    # The rest of the inventory: sequences, synonyms, materialized views, types, indexes. Tables
+    # and program units already have richer entries above, so they are not repeated here.
+    other_objects = [
+        {"name": q(o.name, o.owner), "owner": o.owner, "type": o.type, "status": o.status}
+        for o in report.schema_info.objects
+        if o.type.upper() not in _RICH_OBJECT_TYPES
     ]
 
     log_tables = [
@@ -155,6 +205,7 @@ def build_map_view(report: ScanReport) -> dict:
         "provider": report.metadata.llm_provider,
         "tables": tables,
         "programs": programs,
+        "other_objects": other_objects,
         "log_tables": log_tables,
     }
 
@@ -169,6 +220,12 @@ class AskBody(BaseModel):
 class RunBody(BaseModel):
     sql: str
     max_rows: int = 100
+
+
+class DdlBody(BaseModel):
+    name: str  # bare or "OWNER.OBJECT" (the UI qualifies names in multi-schema maps)
+    type: str = "TABLE"  # Oracle OBJECT_TYPE: TABLE / VIEW / PACKAGE / SEQUENCE / ...
+    owner: str | None = None
 
 
 class ExplainLogBody(BaseModel):
@@ -214,6 +271,29 @@ def create_app(
         question = body.question.strip()
         if not question:
             raise HTTPException(status_code=400, detail="Ask a question.")
+        # Three kinds of answer share this one box. "Write me a procedure like get_balance" is a
+        # request to BUILD something — it produces code, never a query, and Blossa does not run it.
+        if is_code_request(question):
+            prov = _ensure_provider()
+            history_text = " ".join(t.question for t in body.history)
+            prompt = build_codegen_prompt(
+                question,
+                report,
+                language=settings.llm.language,
+                history_text=history_text,
+            )
+            try:
+                raw = prov.generate(CODEGEN_SYSTEM_PROMPT, prompt)
+            except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
+                raise HTTPException(
+                    status_code=502, detail=f"The model call failed: {exc}"
+                ) from exc
+            return {"kind": "code", **parse_codegen_response(raw, report).model_dump()}
+        # "Is there a get_balance procedure?" is answerable from the map alone — and answering it
+        # there is both correct and instant, where a generated catalog query can be neither.
+        known = answer_program_lookup(question, report)
+        if known is not None:
+            return {"kind": "sql", **known.model_dump()}
         prov = _ensure_provider()
         prompt = build_ask_prompt(
             question, report, use_dba=settings.oracle.use_dba_catalog, history=body.history
@@ -223,7 +303,7 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
         result = enforce_error_severity_filter(question, parse_ask_response(raw), report)
-        return result.model_dump()
+        return {"kind": "sql", **result.model_dump()}
 
     @app.post("/api/run")
     def post_run(body: RunBody) -> dict:
@@ -247,6 +327,45 @@ def create_app(
             "row_count": len(rows),
             "capped": len(rows) >= body.max_rows,
         }
+
+    @app.post("/api/ddl")
+    def post_ddl(body: DdlBody) -> dict:
+        # Structure, not rows: the same side of the boundary as the map itself.
+        qualified_owner, object_name = split_qualified(body.name)
+        try:
+            object_name = validate_identifier(object_name, "object")
+            owner = body.owner or qualified_owner or _default_owner(report)
+            owner = validate_identifier(owner, "schema") if owner else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        otype = metadata_type(body.type)
+        ddl, origin, note = "", "", ""
+        if otype and owner:
+            try:
+                with make_db() as db:
+                    rows = db.query(
+                        GET_DDL_SQL, {"otype": otype, "name": object_name, "owner": owner}
+                    )
+                    # GET_DDL hands back a LOB locator, so it must be read while the connection
+                    # is still open — outside the block it fails with DPY-1001.
+                    ddl = clob_text(rows[0].get("DDL") if rows else "").strip()
+                origin = "database"
+            except Exception as exc:  # noqa: BLE001 - fall back to the map rather than fail
+                note = (
+                    f"Oracle would not hand over the DDL ({exc}); "
+                    "showing what the scan captured."
+                )
+        if not ddl:
+            ddl = offline_ddl(report, owner, object_name, body.type)
+            origin = "scan"
+        if not ddl:
+            raise HTTPException(
+                status_code=404,
+                detail=note or f"No DDL available for {body.name}. Re-scan to capture it.",
+            )
+        return {"name": body.name, "type": body.type.upper(), "ddl": ddl,
+                "source": origin, "note": note}
 
     @app.post("/api/logs/explain")
     def post_explain_log(body: ExplainLogBody) -> dict:

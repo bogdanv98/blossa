@@ -203,12 +203,27 @@ class ProgramUnit(BaseModel):
     source: str = ""
 
 
+class CatalogObject(BaseModel):
+    """Any object as listed in ALL_OBJECTS — the object browser's raw inventory.
+
+    Tables, views and program units get richer models of their own; this list is what makes the
+    *other* kinds visible (sequences, synonyms, materialized views, types, indexes) and carries
+    the VALID/INVALID status, which is a real signal for a DBA.
+    """
+
+    name: str
+    owner: str | None = None
+    type: str  # Oracle's OBJECT_TYPE verbatim, e.g. "SEQUENCE", "MATERIALIZED VIEW"
+    status: str = ""  # VALID / INVALID
+
+
 class SchemaInfo(BaseModel):
     """The whole introspected schema."""
 
     name: str
     tables: list[TableInfo] = Field(default_factory=list)
     program_units: list[ProgramUnit] = Field(default_factory=list)
+    objects: list[CatalogObject] = Field(default_factory=list)
 
     def table(self, name: str) -> TableInfo | None:
         return next((t for t in self.tables if t.name == name), None)

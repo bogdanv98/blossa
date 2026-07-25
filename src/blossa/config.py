@@ -62,6 +62,11 @@ class OpenAICompatibleConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     provider: str = "ollama"  # ollama | heuristic | openai_compatible
+    # Language the model WRITES the map in: table purposes, column meanings, program summaries.
+    # "en" (default) or any language name/code, e.g. "ro". Identifiers and SQL are never
+    # translated. Changing this only affects a NEW scan — existing maps keep the language they
+    # were written in. The offline heuristic provider always writes English.
+    language: str = "en"
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     openai_compatible: OpenAICompatibleConfig = Field(default_factory=OpenAICompatibleConfig)
 

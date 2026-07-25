@@ -10,6 +10,7 @@ from blossa.nlquery import (
     _MAX_HISTORY,
     Turn,
     UnsafeQueryError,
+    answer_program_lookup,
     build_ask_prompt,
     build_schema_context,
     parse_ask_response,
@@ -190,6 +191,121 @@ def _report_with_log_table():
         )
     )
     return report
+
+
+_PACKAGE_SOURCE = """PACKAGE core_banking AS
+   FUNCTION get_balance(p_account_id IN NUMBER) RETURN NUMBER;
+   PROCEDURE transfer_funds(p_from IN NUMBER, p_to IN NUMBER);
+END core_banking;PACKAGE BODY core_banking AS
+   FUNCTION money(p_amount IN NUMBER) RETURN NUMBER IS BEGIN RETURN p_amount; END money;
+   FUNCTION get_balance(p_account_id IN NUMBER) RETURN NUMBER IS BEGIN RETURN 0; END get_balance;
+END core_banking;"""
+
+
+def _report_with_package():
+    from blossa.models import ProgramKind, ProgramUnit
+
+    report = _demo_report()
+    report.schema_info.program_units.append(
+        ProgramUnit(name="CORE_BANKING", owner="BANKDEMO", kind=ProgramKind.PACKAGE,
+                    source=_PACKAGE_SOURCE)
+    )
+    return report
+
+
+def test_context_lists_what_a_package_contains():
+    # A packaged routine is not a catalog object, so unless the map spells it out the model can
+    # only "look for it" with a query that structurally cannot find it (and reports 0 rows).
+    ctx = build_schema_context(_report_with_package())
+    pkg = next(p for p in ctx["programs"] if p["name"].endswith("CORE_BANKING"))
+    assert pkg["contains"] == ["GET_BALANCE", "TRANSFER_FUNDS"]
+    assert "MONEY" not in pkg["contains"]  # body-private helper: not callable, not advertised
+
+
+def test_context_lists_units_the_model_never_explained():
+    # Programs come from the captured units, not from the LLM's summaries — an unexplained unit
+    # must still be visible, or the model concludes it does not exist.
+    ctx = build_schema_context(_report_with_package())
+    names = {p["name"] for p in ctx["programs"]}
+    assert any(n.endswith("CORE_BANKING") for n in names)
+    pkg = next(p for p in ctx["programs"] if p["name"].endswith("CORE_BANKING"))
+    assert pkg["does"] == ""  # no semantics for it, but it is listed anyway
+
+
+def _package_report_with_summary():
+    from blossa.models import ProgramKind, ProgramSemantics
+
+    report = _report_with_package()
+    report.program_semantics.append(
+        ProgramSemantics(
+            name="CORE_BANKING", owner="BANKDEMO", kind=ProgramKind.PACKAGE,
+            summary="Runs the core banking operations.", tables_used=["ACCOUNTS"],
+            confidence=ConfidenceLevel.HIGH,
+        )
+    )
+    return report
+
+
+def test_program_lookup_answers_from_the_map_without_sql():
+    # The original failure: a catalog query over *_OBJECTS returns 0 rows for a packaged routine,
+    # which reads as "it does not exist". The map knows better, so answer from it.
+    res = answer_program_lookup("is there a get_balance procedure?", _package_report_with_summary())
+    assert res is not None
+    assert res.sql == ""  # nothing to run
+    assert "CORE_BANKING" in res.explanation and "function" in res.explanation
+    assert "Runs the core banking operations." in res.explanation
+    assert res.confidence == ConfidenceLevel.HIGH
+
+
+def test_program_lookup_answers_a_romanian_question_in_romanian():
+    res = answer_program_lookup("exista vreo procedura get_balance in db?",
+                                _package_report_with_summary())
+    assert res is not None
+    assert res.explanation.startswith("Da")
+    assert "funcție" in res.explanation and "BANKDEMO.CORE_BANKING" in res.explanation
+    assert res.assumptions and "harta scanată" in res.assumptions[0]
+
+
+def test_romanian_is_recognised_from_one_unmistakable_word():
+    # "unde se afla X" carries no diacritics, but it is plainly not an English question.
+    res = answer_program_lookup("unde se afla transfer_funds?", _package_report_with_summary())
+    assert res is not None and res.explanation.startswith("Da")
+
+
+def test_program_lookup_prefers_the_routine_over_its_package():
+    res = answer_program_lookup("where is CORE_BANKING.GET_BALANCE?",
+                                _package_report_with_summary())
+    assert res is not None and "GET_BALANCE exists" in res.explanation
+
+
+def test_program_lookup_stays_out_of_the_way():
+    report = _package_report_with_summary()
+    # A name the map doesn't know: the model must still get its turn (the map covers only the
+    # schemas that were scanned, so absence here is not proof of absence in the database).
+    assert answer_program_lookup("is there a compute_vat procedure?", report) is None
+    # A data question that merely mentions a routine must not be hijacked into a prose answer.
+    assert answer_program_lookup("how many transfers did transfer_funds make?", report) is None
+
+
+def test_ask_prompt_asks_for_the_users_language():
+    from blossa.nlquery import ASK_SYSTEM_PROMPT
+
+    assert "same language" in ASK_SYSTEM_PROMPT.lower()
+
+
+def test_ask_prompt_names_the_detected_language_next_to_the_question():
+    # A generic policy in the system prompt was not enough for a local model; the user turn
+    # carries the concrete instruction.
+    ro = build_ask_prompt("cate conturi avem pe fiecare status?", _demo_report())
+    assert "Romanian" in ro
+    en = build_ask_prompt("how many accounts per status?", _demo_report())
+    assert "Romanian" not in en
+
+
+def test_catalog_reference_steers_packaged_routines_to_the_right_view():
+    prompt = build_ask_prompt("is there a get_balance procedure?", _report_with_package())
+    assert "ALL_PROCEDURES" in prompt
+    assert "PROCEDURE_NAME" in prompt
 
 
 def test_context_exposes_log_tables_with_roles():

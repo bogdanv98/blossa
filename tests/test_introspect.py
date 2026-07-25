@@ -59,6 +59,14 @@ class FakeDB:
         if "ALL_IND_COLUMNS" in s:
             return [{"INDEX_NAME": "IX_ORDERS_CUST", "TABLE_NAME": "ORDERS",
                      "COLUMN_NAME": "CUST_ID", "COLUMN_POSITION": 1}]
+        if "ALL_OBJECTS" in s:
+            return [
+                {"OBJECT_NAME": "CUSTOMERS", "OBJECT_TYPE": "TABLE", "STATUS": "VALID"},
+                {"OBJECT_NAME": "ORDER_SEQ", "OBJECT_TYPE": "SEQUENCE", "STATUS": "VALID"},
+                {"OBJECT_NAME": "CUST_SYN", "OBJECT_TYPE": "SYNONYM", "STATUS": "VALID"},
+                {"OBJECT_NAME": "SALES_MV", "OBJECT_TYPE": "MATERIALIZED VIEW",
+                 "STATUS": "INVALID"},
+            ]
         return []
 
 
@@ -81,6 +89,29 @@ def test_introspect_assembles_tables_columns_and_fk():
     assert fks[0].referenced_table == "CUSTOMERS"
     assert fks[0].referenced_columns == ["CUST_ID"]
     assert orders.indexes[0].columns == ["CUST_ID"]
+
+
+def test_introspect_lists_the_whole_object_catalog():
+    # The workspace browser needs the objects that have no model of their own — sequences,
+    # synonyms, materialized views — plus each object's VALID/INVALID status.
+    schema = introspect_schema(FakeDB(), "BLOSSA_DEMO")
+    by_name = {o.name: o for o in schema.objects}
+    assert by_name["ORDER_SEQ"].type == "SEQUENCE"
+    assert by_name["CUST_SYN"].type == "SYNONYM"
+    assert by_name["SALES_MV"].status == "INVALID"
+    assert by_name["ORDER_SEQ"].owner == "BLOSSA_DEMO"
+
+
+def test_object_catalog_failure_does_not_abort_the_scan():
+    class _NoObjectCatalog(FakeDB):
+        def query(self, sql: str, binds=None):
+            if "ALL_OBJECTS" in sql.upper():
+                raise RuntimeError("ORA-00942: table or view does not exist")
+            return super().query(sql, binds)
+
+    schema = introspect_schema(_NoObjectCatalog(), "BLOSSA_DEMO")
+    assert schema.objects == []
+    assert {t.name for t in schema.tables} == {"CUSTOMERS", "ORDERS"}  # tables still scanned
 
 
 # --------------------------------------------------------- "*" non-system schema discovery

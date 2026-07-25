@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..models import (
+    CatalogObject,
     ColumnInfo,
     ConstraintInfo,
     ConstraintType,
@@ -108,6 +109,24 @@ _VIEWS_SQL = """
      ORDER BY VIEW_NAME
 """
 
+# The full object inventory for the browser. Bodies fold into their spec (PACKAGE BODY/TYPE BODY),
+# partitions and LOB segments are storage detail, and GENERATED='N' drops the system-named indexes
+# Oracle creates for constraints (SYS_C00...) — a user browsing objects doesn't want either.
+_OBJECT_TYPES = (
+    "TABLE", "VIEW", "PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER",
+    "SEQUENCE", "SYNONYM", "MATERIALIZED VIEW", "TYPE", "INDEX",
+)
+
+_OBJECTS_SQL = """
+    SELECT OBJECT_NAME, OBJECT_TYPE, STATUS
+      FROM {view}
+     WHERE OWNER = :owner
+       AND OBJECT_TYPE IN ({types})
+       AND OBJECT_NAME NOT LIKE 'BIN$%'
+       AND GENERATED = 'N'
+     ORDER BY OBJECT_TYPE, OBJECT_NAME
+"""
+
 # ALL_SOURCE.TYPE -> the program kind we expose (spec and body both fold into one PACKAGE unit).
 _KIND_BY_SOURCE_TYPE = {
     "PROCEDURE": ProgramKind.PROCEDURE,
@@ -150,6 +169,7 @@ def introspect_schema(db: QueryExecutor, owner: str, use_dba: bool = False) -> S
             )
         )
     schema.program_units = _build_program_units(db, owner, binds, use_dba)
+    schema.objects = _build_catalog_objects(db, owner, binds, use_dba)
     return schema
 
 
@@ -201,6 +221,7 @@ def introspect_schemas(db: QueryExecutor, owners: list[str], use_dba: bool = Fal
         one = introspect_schema(db, owner, use_dba)
         merged.tables.extend(one.tables)
         merged.program_units.extend(one.program_units)
+        merged.objects.extend(one.objects)
     return merged
 
 
@@ -343,6 +364,32 @@ def _build_program_units(
         *_plsql_units(db, owner, binds, use_dba),
         *_trigger_units(db, owner, binds, use_dba),
         *_view_units(db, owner, binds, use_dba),
+    ]
+
+
+def _build_catalog_objects(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool = False
+) -> list[CatalogObject]:
+    """List every browsable object the owner has (names + status only, no source).
+
+    Cheap and privilege-tolerant: a failure here just means the object browser falls back to
+    tables + program units, so it must never abort a scan.
+    """
+    view = "DBA_OBJECTS" if use_dba else "ALL_OBJECTS"
+    types = ", ".join(f"'{t}'" for t in _OBJECT_TYPES)
+    sql = _OBJECTS_SQL.format(view=view, types=types)  # noqa: S608 - both are fixed constants
+    try:
+        rows = db.query(sql, binds)
+    except Exception:  # noqa: BLE001 - no access to the object catalog: browse what we have
+        return []
+    return [
+        CatalogObject(
+            name=r["OBJECT_NAME"],
+            owner=owner,
+            type=(r.get("OBJECT_TYPE") or "").strip(),
+            status=(r.get("STATUS") or "").strip(),
+        )
+        for r in rows
     ]
 
 

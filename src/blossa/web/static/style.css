@@ -40,7 +40,14 @@ header {
 .tab-panel.active { display: block; }
 
 /* Ask ------------------------------------------------------------------- */
-.ask-bar { display: flex; gap: 8px; }
+/* The bar follows the scroll: answers grow downward, and the next question must never be a
+   scroll-back-to-top away. The gradient keeps content from showing through its rounded corners. */
+.ask-bar {
+  display: flex; gap: 8px;
+  position: sticky; top: 0; z-index: 10;
+  padding: 12px 0 10px;
+  background: linear-gradient(var(--bg) 82%, transparent);
+}
 #question {
   flex: 1; padding: 12px 14px; font-size: 16px;
   border: 1px solid var(--line); border-radius: 10px; background: var(--panel);

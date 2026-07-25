@@ -296,7 +296,11 @@ function renderTree(filter = "") {
   const q = filter.trim().toLowerCase();
   const match = (n) => n.toLowerCase().includes(q);
   const tables = MAP.tables.filter((t) => match(t.name));
-  const progs = (MAP.programs || []).filter((p) => match(p.name));
+  // A package matches on its routines too — searching "get_balance" should find CORE_BANKING,
+  // since that name exists nowhere else in the catalog.
+  const progs = (MAP.programs || []).filter(
+    (p) => match(p.name) || (p.subprograms || []).some((s) => match(s.name))
+  );
   const others = (MAP.other_objects || []).filter((o) => match(o.name));
   const ofKind = (k) => progs.filter((p) => (p.kind || "").toUpperCase() === k);
   const ofType = (t) => others.filter((o) => (o.type || "").toUpperCase() === t);
@@ -356,16 +360,42 @@ function treeTable(t) {
   return el("div", { class: "ws-table" }, head, cols);
 }
 
-// A view or a stored program: clicking shows its source/DDL + AI summary; views can also be previewed.
+// A view or a stored program: clicking shows its source/DDL + AI summary; views can also be
+// previewed. A package expands to the routines it declares — they are not catalog objects, so
+// this tree is the only place they can be browsed.
 function treeObject(p, kind) {
-  const head = el("div", { class: "ws-thead" },
-    el("span", { class: "ws-tri-gap" }),
-    el("span", { class: "ws-tname", text: p.name }));
+  const routines = p.subprograms || [];
+  const body = el("div", { class: "ws-cols hidden" });
+  const tri = el("span", { class: routines.length ? "ws-tri" : "ws-tri-gap",
+    text: routines.length ? "▸" : "" });
+  const head = el("div", { class: "ws-thead" }, tri, el("span", { class: "ws-tname", text: p.name }));
   if (p.status && p.status.toUpperCase() === "INVALID")
     head.append(el("span", { class: "pill invalid", title: "The object is INVALID", text: "!" }));
-  head.addEventListener("click", () => showObjectDetail(p, kind));
+  head.addEventListener("click", () => {
+    showObjectDetail(p, kind);
+    if (!routines.length) return;
+    if (!body.dataset.built) {
+      routines.forEach((r) => body.append(treeSubprogram(p, r)));
+      body.dataset.built = "1";
+    }
+    tri.textContent = body.classList.toggle("hidden") ? "▸" : "▾";
+  });
   if (kind === "view") head.append(iconButton("⤓", "Preview 100 rows", () => previewName(p.name)));
-  return el("div", { class: "ws-table" }, head);
+  return el("div", { class: "ws-table" }, head, body);
+}
+
+// A routine inside a package. Clicking inserts the qualified call into the editor, the way
+// clicking a column does — there is no DDL of its own to show, only the package's.
+function treeSubprogram(pkg, routine) {
+  const row = el("div", { class: "ws-col" },
+    el("span", { class: "ws-cname", text: routine.name }),
+    el("span", { class: "ws-ctype muted", text: (routine.kind || "").toLowerCase() }));
+  row.title = `${routine.kind} declared in ${pkg.name} — click to insert the call`;
+  row.addEventListener("click", (e) => {
+    e.stopPropagation();
+    insertAtCursor($("#ws-sql"), `${pkg.name}.${routine.name}`);
+  });
+  return row;
 }
 
 // Sequences, synonyms, materialized views, types, indexes: name + status in the tree, DDL on click.
@@ -417,7 +447,8 @@ function showObjectDetail(p, kind) {
     box.append(el("p", { class: "muted small", text: "Tables used: " + p.tables_used.join(", ") }));
   // A package's routines are not catalog objects, so this list is the only place they show up.
   if (p.subprograms && p.subprograms.length)
-    box.append(el("p", { class: "muted small", text: "Contains: " + p.subprograms.join(", ") }));
+    box.append(el("p", { class: "muted small",
+      text: "Contains: " + p.subprograms.map((s) => s.name).join(", ") }));
   if (p.source && p.source.trim()) {
     box.append(el("p", { class: "muted small", text: kind === "view" ? "Defining query:" : "Source:" }));
     box.append(sourcePane(p.source));

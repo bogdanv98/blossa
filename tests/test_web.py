@@ -187,6 +187,31 @@ def test_map_view_lists_other_catalog_objects():
     assert view["other_objects"][0]["name"] == "ORDER_SEQ"
 
 
+def test_map_view_lists_a_packages_routines_with_their_kind():
+    # PROCEDURES/FUNCTIONS read 0 in the tree while a package holds a dozen of them: they are not
+    # catalog objects, so the package's own entry is the only place they can be discovered.
+    from blossa.models import ProgramKind, ProgramUnit
+
+    report = _report()
+    report.schema_info.program_units.append(
+        ProgramUnit(
+            name="CORE_BANKING", owner="BANKDEMO", kind=ProgramKind.PACKAGE,
+            source=(
+                "PACKAGE core_banking AS\n"
+                "  FUNCTION get_balance(p_id NUMBER) RETURN NUMBER;\n"
+                "  PROCEDURE deposit(p_id NUMBER);\n"
+                "END;PACKAGE BODY core_banking AS\n"
+                "  FUNCTION money(p NUMBER) RETURN NUMBER IS BEGIN RETURN p; END;\nEND;"
+            ),
+        )
+    )
+    pkg = next(p for p in build_map_view(report)["programs"] if p["name"].endswith("CORE_BANKING"))
+    assert pkg["subprograms"] == [
+        {"name": "GET_BALANCE", "kind": "FUNCTION"},
+        {"name": "DEPOSIT", "kind": "PROCEDURE"},
+    ]  # body-private money() is not callable, so it is not advertised
+
+
 def test_map_view_marks_invalid_program_units():
     from blossa.models import CatalogObject, ProgramKind, ProgramUnit
 

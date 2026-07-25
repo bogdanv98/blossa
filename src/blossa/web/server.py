@@ -71,7 +71,7 @@ from ..nlquery import (
     validate_read_only_select,
     with_row_limit,
 )
-from ..program import package_subprograms
+from ..program import declared_subprograms
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -170,9 +170,12 @@ def build_map_view(report: ScanReport) -> dict:
             "source": u.source or "",
             # VALID/INVALID from the catalog — an invalid package is worth seeing in the tree.
             "status": obj_status.get(((u.owner or "").upper(), u.name.upper(), u.kind.value), ""),
-            # What a package declares: these routines exist only inside it, never in the catalog.
+            # What a package declares: these routines exist only inside it, never in the catalog,
+            # so the tree is the only place a user can discover them.
             "subprograms": (
-                package_subprograms(u.source) if u.kind == ProgramKind.PACKAGE else []
+                [{"name": n, "kind": k.value} for n, k in declared_subprograms(u.source)]
+                if u.kind == ProgramKind.PACKAGE
+                else []
             ),
         }
         for u in report.schema_info.program_units

@@ -8,11 +8,14 @@ from blossa.llm.heuristic import HeuristicProvider
 from blossa.models import ConfidenceLevel, LogColumn, LogKind, LogRole, LogTable
 from blossa.nlquery import (
     _MAX_HISTORY,
+    AskResult,
     Turn,
     UnsafeQueryError,
     answer_program_lookup,
     build_ask_prompt,
     build_schema_context,
+    catalog_reference,
+    expand_count_to_list,
     parse_ask_response,
     privilege_hint,
     validate_read_only_select,
@@ -291,6 +294,53 @@ def test_ask_prompt_asks_for_the_users_language():
     from blossa.nlquery import ASK_SYSTEM_PROMPT
 
     assert "same language" in ASK_SYSTEM_PROMPT.lower()
+
+
+def _counted(sql: str) -> AskResult:
+    return AskResult(sql=sql, explanation="", confidence=ConfidenceLevel.HIGH)
+
+
+_VIEW_COUNT = (
+    "SELECT COUNT(*) FROM DBA_VIEWS WHERE OWNER IN "
+    "(SELECT USERNAME FROM DBA_USERS WHERE ORACLE_MAINTAINED='N')"
+)
+
+
+def test_which_question_gets_the_names_not_a_count():
+    # The live failure: "exista view-uri in baza de date?" answered COUNT(*) = 1, which hides the
+    # answer. Every filter the model wrote is kept; only the projection changes.
+    result = expand_count_to_list("exista view-uri in baza de date?", _counted(_VIEW_COUNT))
+    assert result.sql.startswith("SELECT OWNER, VIEW_NAME FROM DBA_VIEWS")
+    assert "ORACLE_MAINTAINED='N'" in result.sql  # the model's filter survived
+    assert result.sql.rstrip().endswith("ORDER BY 1")
+    assert any("listat" in a for a in result.assumptions)  # said in the question's language
+
+
+def test_counting_questions_are_left_alone():
+    for question in ("how many views are there?", "cate view-uri sunt in baza de date?"):
+        assert expand_count_to_list(question, _counted(_VIEW_COUNT)).sql == _VIEW_COUNT
+
+
+def test_count_distinct_owner_lists_the_owners():
+    sql = "SELECT COUNT(DISTINCT OWNER) FROM DBA_TABLES WHERE OWNER != 'SYS'"
+    assert expand_count_to_list("which schemas exist?", _counted(sql)).sql.startswith(
+        "SELECT DISTINCT OWNER FROM DBA_TABLES"
+    )
+
+
+def test_a_business_count_is_not_rewritten():
+    # Only catalog views have known identity columns; an application table is left untouched.
+    sql = "SELECT COUNT(*) FROM BANKDEMO.ACCOUNTS WHERE STATUS = 'ACTIVE'"
+    assert expand_count_to_list("which accounts are active?", _counted(sql)).sql == sql
+
+
+def test_catalog_reference_separates_counting_from_listing():
+    # "exista view-uri?" used to return COUNT(*) = 1, because the few-shot pattern read
+    # "How many/which VIEWS: SELECT COUNT(*)" — a number cannot answer "which" or "is there any".
+    for use_dba in (False, True):
+        catalog = catalog_reference(use_dba)
+        assert "COUNT vs LIST" in catalog
+        assert "How many/which" not in catalog
 
 
 def test_ask_prompt_names_the_detected_language_next_to_the_question():

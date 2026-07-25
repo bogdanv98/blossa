@@ -65,6 +65,7 @@ from ..nlquery import (
     answer_program_lookup,
     build_ask_prompt,
     enforce_error_severity_filter,
+    expand_count_to_list,
     parse_ask_response,
     privilege_hint,
     validate_read_only_select,
@@ -303,6 +304,7 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
         result = enforce_error_severity_filter(question, parse_ask_response(raw), report)
+        result = expand_count_to_list(question, result)
         return {"kind": "sql", **result.model_dump()}
 
     @app.post("/api/run")

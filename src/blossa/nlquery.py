@@ -173,14 +173,18 @@ CATALOG_REFERENCE_SCOPED = (
     "restrict to application owners: keep only owners with ALL_USERS.ORACLE_MAINTAINED='N' (this "
     "drops SYS/SYSTEM/XDB and the like).\n"
     "Distinguish the two countings carefully — copy these exact patterns:\n"
-    "  * How many/which TABLES (one row per table): "
+    "  * COUNT vs LIST — the patterns below COUNT. If the user asks WHICH ones, to LIST them, or "
+    "whether any EXIST at all, select the identifying columns instead of COUNT(*) (e.g. SELECT "
+    "OWNER, VIEW_NAME FROM ... ORDER BY 1, 2). A bare number answers 'how many', never 'which' or "
+    "'is there any' — the user cannot see what was found.\n"
+    "  * How many TABLES (one row per table): "
     "SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER IN "
     "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N'). "
     "Do NOT wrap this in DISTINCT OWNER — that would count schemas, not tables.\n"
-    "  * How many/which SCHEMAS (one row per owner): "
+    "  * How many SCHEMAS (one row per owner): "
     "SELECT COUNT(DISTINCT OWNER) FROM ALL_TABLES WHERE OWNER IN "
     "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N').\n"
-    "  * How many/which VIEWS: SELECT COUNT(*) FROM ALL_VIEWS WHERE OWNER IN "
+    "  * How many VIEWS: SELECT COUNT(*) FROM ALL_VIEWS WHERE OWNER IN"
     "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N'). For another object kind, count "
     "ALL_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
     "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
@@ -212,13 +216,17 @@ CATALOG_REFERENCE_FULL = (
     "Application accounts are ORACLE_MAINTAINED='N', but a few Oracle operational accounts also "
     "carry that flag — exclude them everywhere with this filter:\n"
     f"    {_APP_OWNER_FILTER}\n"
-    "  * How many/which TABLES (one row per table): "
+    "  * COUNT vs LIST — the patterns below COUNT. If the user asks WHICH ones, to LIST them, or "
+    "whether any EXIST at all, select the identifying columns instead of COUNT(*) (e.g. SELECT "
+    "OWNER, VIEW_NAME FROM ... ORDER BY 1, 2). A bare number answers 'how many', never 'which' or "
+    "'is there any' — the user cannot see what was found.\n"
+    "  * How many TABLES (one row per table): "
     "SELECT COUNT(*) FROM DBA_TABLES WHERE OWNER IN "
     f"(SELECT USERNAME FROM DBA_USERS {_APP_OWNER_FILTER}). "
     "Do NOT wrap this in DISTINCT OWNER — that would count schemas, not tables.\n"
-    "  * How many/which SCHEMAS (one row per owner, including app accounts with no tables yet): "
+    "  * How many SCHEMAS (one row per owner, including app accounts with no tables yet): "
     f"SELECT COUNT(*) FROM DBA_USERS {_APP_OWNER_FILTER}.\n"
-    "  * How many/which VIEWS: SELECT COUNT(*) FROM DBA_VIEWS WHERE OWNER IN "
+    "  * How many VIEWS: SELECT COUNT(*) FROM DBA_VIEWS WHERE OWNER IN"
     f"(SELECT USERNAME FROM DBA_USERS {_APP_OWNER_FILTER}). For another object kind, count "
     "DBA_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
     "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
@@ -582,6 +590,90 @@ def answer_program_lookup(question: str, report: ScanReport) -> AskResult | None
         ],
         confidence=ConfidenceLevel.HIGH,
     )
+
+
+# --------------------------------------------------- "which ones?" safety net
+
+# "Are there any views?" answered with COUNT(*) = 1 tells the user a number and hides the answer.
+# Prompt guidance did not hold (the model copies the counting pattern anyway), so this rewrites the
+# projection deterministically: same query, same filters, but selecting the names it found.
+
+_LIST_INTENT = (
+    "which", "list ", "show me", "what are", "name them", "are there any", "is there any",
+    "care sunt", "care este", "ce view", "exista", "există", "listeaz", "arata", "arată",
+    "spune-mi care", "care anume",
+)
+# A counting question stays a counting question, even if it also contains a listing word.
+_COUNT_INTENT = (
+    "how many", "how much", "count of", "number of", "cate ", "câte ", "numar", "număr",
+)
+
+# Dictionary view -> the columns that identify a row in it. Only views we actually steer the model
+# towards; anything else is left alone rather than guessed at.
+_CATALOG_IDENTITY = {
+    "VIEWS": "OWNER, VIEW_NAME",
+    "TABLES": "OWNER, TABLE_NAME",
+    "USERS": "USERNAME",
+    "OBJECTS": "OWNER, OBJECT_NAME, OBJECT_TYPE",
+    "PROCEDURES": "OWNER, OBJECT_NAME, PROCEDURE_NAME",
+    "INDEXES": "OWNER, INDEX_NAME, TABLE_NAME",
+    "SEQUENCES": "SEQUENCE_OWNER, SEQUENCE_NAME",
+    "TRIGGERS": "OWNER, TRIGGER_NAME, TABLE_NAME",
+    "SYNONYMS": "OWNER, SYNONYM_NAME",
+    "CONSTRAINTS": "OWNER, CONSTRAINT_NAME, TABLE_NAME",
+    "SCHEDULER_JOBS": "OWNER, JOB_NAME",
+    "SCHEDULER_CHAINS": "OWNER, CHAIN_NAME",
+}
+
+_COUNT_SELECT = re.compile(r"^\s*SELECT\s+COUNT\s*\(\s*(DISTINCT\s+)?[^)]*\)\s+FROM\s+", re.I)
+_CATALOG_FROM = re.compile(r"\bFROM\s+(?:ALL|DBA|USER)_([A-Z_]+)", re.I)
+
+
+def _wants_a_list(question: str) -> bool:
+    q = question.lower()
+    if any(w in q for w in _COUNT_INTENT):
+        return False
+    return any(w in q for w in _LIST_INTENT)
+
+
+def expand_count_to_list(question: str, result: AskResult) -> AskResult:
+    """Turn `SELECT COUNT(*) FROM <catalog view>` into a listing when the user asked WHICH.
+
+    Only the projection changes — every filter the model wrote is kept, so the rows returned are
+    exactly the ones it was counting. Left untouched when the question is a counting one, when the
+    query is not a simple catalog count, or when we have no identity columns for that view.
+    """
+    if not result.answerable or not _wants_a_list(question):
+        return result
+    sql = result.sql.strip()
+    match = _COUNT_SELECT.match(sql)
+    # The regex anchors on the OUTER projection, so a subquery in the WHERE clause is fine — only
+    # a set operation would make "replace the select list" mean something else.
+    if not match or any(
+        op in sql.upper() for op in (" UNION ", " MINUS ", " INTERSECT ", " GROUP BY ")
+    ):
+        return result
+    catalog = _CATALOG_FROM.search(sql)
+    if not catalog:
+        return result
+    identity = _CATALOG_IDENTITY.get(catalog.group(1).upper())
+    if not identity:
+        return result
+    if match.group(1):  # COUNT(DISTINCT owner) -> the distinct values themselves
+        identity = f"DISTINCT {identity.split(',')[0].strip()}"
+    rest = sql[match.end():]
+    listed = f"SELECT {identity} FROM {rest}"
+    if not re.search(r"\bORDER\s+BY\b", listed, re.IGNORECASE):
+        listed = f"{listed}\nORDER BY 1"
+    result.sql = listed
+    romanian = _looks_romanian(question)
+    result.assumptions = [
+        *result.assumptions,
+        "Am listat obiectele gasite, nu doar numarul lor - intreaba 'cate ...' pentru un total."
+        if romanian
+        else "Listed what was found rather than just counting it — ask 'how many …' for a total.",
+    ]
+    return result
 
 
 # --------------------------------------------------- error-severity safety net

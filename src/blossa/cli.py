@@ -55,6 +55,7 @@ from .nlquery import (
     answer_program_lookup,
     build_ask_prompt,
     enforce_error_severity_filter,
+    expand_count_to_list,
     parse_ask_response,
     privilege_hint,
     validate_read_only_select,
@@ -337,6 +338,7 @@ def _answer_ask_turn(
         return None
     result = parse_ask_response(raw)
     result = enforce_error_severity_filter(question, result, report)
+    result = expand_count_to_list(question, result)
 
     if not result.answerable:
         # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from

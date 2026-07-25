@@ -190,6 +190,14 @@ class TableInfo(BaseModel):
         return [c for c in self.constraints if c.type == ConstraintType.FOREIGN_KEY]
 
 
+class RoutineSemantics(BaseModel):
+    """One sentence on a routine INSIDE a package — captured in the same model call that
+    explains the package, since packaged routines are not units of their own."""
+
+    name: str
+    summary: str = ""
+
+
 class ProgramUnit(BaseModel):
     """A stored program unit (procedure/function/package/trigger) or view, with its source.
 
@@ -347,6 +355,12 @@ class ProgramSemantics(BaseModel):
     tables_used: list[str] = Field(default_factory=list)
     confidence: ConfidenceLevel
     evidence: list[str] = Field(default_factory=list)
+    # For a package: one sentence per declared routine (same model call, richer contract).
+    routines: list[RoutineSemantics] = Field(default_factory=list)
+
+    def routine_summary(self, name: str) -> str:
+        n = name.upper()
+        return next((r.summary for r in self.routines if r.name.upper() == n), "")
 
 
 # -------------------------------------------------------------- final report

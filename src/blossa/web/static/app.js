@@ -314,25 +314,31 @@ function renderTree(filter = "") {
     { label: "Types", items: ofType("TYPE"), render: treeCatalogObject },
     { label: "Indexes", items: ofType("INDEX"), render: treeCatalogObject },
   ];
+  // Browsing shows EVERY category, empty ones included: "Views 0" tells you this schema has none,
+  // where a missing folder only makes you wonder whether the tool can show them at all. While
+  // searching, empty folders are noise — the point is then to see what matched.
   let any = false;
   cats.forEach((c) => {
-    if (!c.items.length) return;
-    any = true;
-    box.append(treeCategory(c.label, c.items, c.render, c.open || q !== ""));
+    if (q !== "" && !c.items.length) return;
+    if (c.items.length) any = true;
+    box.append(treeCategory(c.label, c.items, c.render, c.items.length > 0 && (c.open || q !== "")));
   });
   if (!any) box.append(el("p", { class: "muted small", text: "No objects match." }));
 }
 
 function treeCategory(label, items, render, open) {
+  const empty = items.length === 0;
   const body = el("div", { class: "ws-cat-body" + (open ? "" : " hidden") });
   items.forEach((it) => body.append(render(it)));
-  const tri = el("span", { class: "ws-tri", text: open ? "▾" : "▸" });
-  const head = el("div", { class: "ws-cat" }, tri,
+  const tri = el("span", { class: "ws-tri", text: empty ? "" : open ? "▾" : "▸" });
+  const head = el("div", { class: "ws-cat" + (empty ? " empty" : "") }, tri,
     el("span", { class: "ws-cat-label", text: label }),
     el("span", { class: "ws-cat-count", text: String(items.length) }));
-  head.addEventListener("click", () => {
-    tri.textContent = body.classList.toggle("hidden") ? "▸" : "▾";
-  });
+  if (empty) head.title = `No ${label.toLowerCase()} in the scanned schema(s).`;
+  else
+    head.addEventListener("click", () => {
+      tri.textContent = body.classList.toggle("hidden") ? "▸" : "▾";
+    });
   return el("div", { class: "ws-cat-wrap" }, head, body);
 }
 

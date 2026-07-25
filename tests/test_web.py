@@ -434,3 +434,13 @@ def test_static_app_js_served():
     assert "renderGrid" in r.text  # shared sortable/exportable result grid
     assert "other_objects" in r.text  # sequences/synonyms/… folders in the object tree
     assert "/api/ddl" in r.text  # the DDL viewer
+
+
+def test_object_tree_lists_every_category_it_supports():
+    # A schema with no views must still show a "Views 0" folder: a missing folder reads as
+    # "this tool cannot show views", which is a different (and wrong) message.
+    js = _client().get("/static/app.js").text
+    for label in ("Tables", "Views", "Packages", "Procedures", "Functions", "Triggers",
+                  "Materialized views", "Sequences", "Synonyms", "Types", "Indexes"):
+        assert f'label: "{label}"' in js
+    assert "empty ones included" in js  # the rule is stated where it is implemented

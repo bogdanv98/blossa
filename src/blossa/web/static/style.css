@@ -116,6 +116,9 @@ th.sortable:hover { background: #f0f0f2; }
 .ws-cat-label { flex: 1; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .ws-cat-count { font-size: 11px; color: var(--muted); background: var(--bg); border-radius: 999px; padding: 1px 8px; }
 .ws-cat-body { padding-left: 6px; margin-bottom: 4px; }
+/* An empty category still shows, so "no views here" reads differently from "no such feature". */
+.ws-cat.empty { cursor: default; opacity: .45; }
+.ws-cat.empty:hover { background: transparent; }
 .ws-tri-gap { width: 12px; display: inline-block; }
 .ws-table { margin-bottom: 1px; }
 .ws-thead { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 7px; cursor: pointer; }

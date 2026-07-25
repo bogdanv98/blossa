@@ -30,7 +30,8 @@ import re
 from pydantic import BaseModel, Field
 
 from .logsense import ERROR_SEVERITIES
-from .models import ConfidenceLevel, LogRole, ScanReport
+from .models import ConfidenceLevel, LogRole, ProgramKind, ScanReport
+from .program import declared_subprograms, package_subprograms
 
 # Keywords that must never appear in a query we are about to run. The READ ONLY transaction on the
 # connection is the real backstop; this is defence-in-depth and gives a clearer error message.
@@ -81,14 +82,24 @@ ASK_SYSTEM_PROMPT = (
     "question into exactly ONE read-only Oracle SQL query.\n\n"
     "You are given a semantic map of the application schema(s) — tables, columns with inferred "
     "business meaning, relationships, a 'programs' list (stored procedures/functions/packages/"
-    "triggers/views, each with a plain-language 'does' summary), and a 'log_tables' list "
+    "triggers/views, each with a plain-language 'does' summary, and for a package a 'contains' "
+    "list of the procedures/functions it declares), and a 'log_tables' list "
     "(application log/error/audit tables, each column tagged with a role) — and a short 'Catalog "
     "views' list of Oracle data-dictionary views for questions about the database itself.\n\n"
     "Rules:\n"
+    "- ANSWER IN THE USER'S LANGUAGE: write \"explanation\" and \"assumptions\" in the same "
+    "language the question was asked in (a Romanian question gets a Romanian answer). Only the "
+    "SQL itself stays in English/Oracle syntax.\n"
     "- If the question asks what a procedure/function/package/trigger/view DOES, or about the "
     "application's logic, ANSWER IT IN PLAIN LANGUAGE from the 'programs' summaries in the map: "
     "put the answer in \"explanation\" and set \"sql\" to \"\" (there is no query to run). Name "
     "the units you describe. If the asked-about unit is not in the map, say so.\n"
+    "- If the question asks WHETHER a procedure/function EXISTS (e.g. 'is there a get_balance "
+    "procedure?'), answer from the 'programs' list FIRST, checking each package's 'contains': a "
+    "packaged subprogram is NOT an object in the catalog, so a query over *_OBJECTS can never find "
+    "one and 'no rows' would wrongly read as 'it does not exist'. When it is in the map, set "
+    "\"sql\" to \"\" and say where it lives (which package, which owner). Only if the map has no "
+    "match, search the catalog with the *_PROCEDURES view described below.\n"
     "- The question may be a FOLLOW-UP that refines the previous query in the conversation (e.g. "
     "'now break it down by year', 'only the top 5', 'add their email', 'exclude interns'). When it "
     "clearly builds on the last query, START FROM the most recent SQL shown in the conversation "
@@ -146,7 +157,13 @@ CATALOG_REFERENCE_SCOPED = (
     "- ALL_VIEWS(OWNER, VIEW_NAME): views this account can read.\n"
     "- ALL_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects of EVERY kind (TABLE, VIEW, INDEX, "
     "SEQUENCE, PROCEDURE, TRIGGER, ...). To count one kind you MUST filter OBJECT_TYPE; without it "
-    "you count all kinds at once.\n"
+    "you count all kinds at once. It lists only TOP-LEVEL objects: a procedure or function "
+    "declared inside a package is NOT here (only the package is), so never search it by name.\n"
+    "- ALL_PROCEDURES(OWNER, OBJECT_NAME, PROCEDURE_NAME): the callable subprograms. For a "
+    "package, OBJECT_NAME is the package and PROCEDURE_NAME the routine inside it; for a "
+    "standalone procedure/function, OBJECT_NAME is its name and PROCEDURE_NAME is NULL. This is "
+    "the ONLY view "
+    "that finds a packaged routine by name: WHERE PROCEDURE_NAME = 'GET_BALANCE'.\n"
     "- ALL_USERS(USERNAME, ORACLE_MAINTAINED): use ONLY to tell application owners "
     "(ORACLE_MAINTAINED='N') from Oracle-internal ones; never list schemas from it directly — it "
     "shows every user, not just what this account can read.\n"
@@ -183,7 +200,13 @@ CATALOG_REFERENCE_FULL = (
     "- DBA_VIEWS(OWNER, VIEW_NAME): all views.\n"
     "- DBA_OBJECTS(OWNER, OBJECT_NAME, OBJECT_TYPE): objects of EVERY kind (TABLE, VIEW, INDEX, "
     "SEQUENCE, PROCEDURE, TRIGGER, ...). To count one kind you MUST filter OBJECT_TYPE; without it "
-    "you count all kinds at once.\n"
+    "you count all kinds at once. It lists only TOP-LEVEL objects: a procedure or function "
+    "declared inside a package is NOT here (only the package is), so never search it by name.\n"
+    "- DBA_PROCEDURES(OWNER, OBJECT_NAME, PROCEDURE_NAME): the callable subprograms. For a "
+    "package, OBJECT_NAME is the package and PROCEDURE_NAME the routine inside it; for a "
+    "standalone procedure/function, OBJECT_NAME is its name and PROCEDURE_NAME is NULL. This is "
+    "the ONLY view "
+    "that finds a packaged routine by name: WHERE PROCEDURE_NAME = 'GET_BALANCE'.\n"
     "- DBA_TAB_COMMENTS / DBA_COL_COMMENTS: documentation comments.\n"
     "Distinguish the two countings carefully — copy these exact patterns:\n"
     "Application accounts are ORACLE_MAINTAINED='N', but a few Oracle operational accounts also "
@@ -274,15 +297,42 @@ def build_schema_context(report: ScanReport) -> dict:
             f"{src}({', '.join(r.from_columns)}) -> {dst}({', '.join(r.to_columns)}) [{kind}]"
         )
 
-    programs = [
-        {
-            "name": _qualified(p.name, p.owner, multi),
-            "kind": p.kind.value,
-            "does": p.summary,
-            "tables_used": p.tables_used,
+    # Driven by the captured units, not by the LLM's summaries: a unit the model never explained
+    # (offline scan, or a failed explain) still has to be visible, or the model will conclude it
+    # does not exist. For a package we also list what it CONTAINS — a packaged procedure/function
+    # is not an object in the catalog, so the spec is the only place its name can come from.
+    sem_by_unit = {
+        (s.owner, s.name, s.kind): s for s in report.program_semantics
+    }
+    programs = []
+    seen_units = set()
+    for unit in report.schema_info.program_units:
+        key = (unit.owner, unit.name, unit.kind)
+        seen_units.add(key)
+        sem = sem_by_unit.get(key)
+        entry = {
+            "name": _qualified(unit.name, unit.owner, multi),
+            "kind": unit.kind.value,
+            "does": sem.summary if sem else "",
+            "tables_used": sem.tables_used if sem else [],
         }
-        for p in report.program_semantics
-    ]
+        if unit.kind == ProgramKind.PACKAGE:
+            contains = package_subprograms(unit.source)
+            if contains:
+                entry["contains"] = contains
+        programs.append(entry)
+    # A summary whose source was not captured (older map, or a unit read through a view the
+    # account cannot see) still belongs in the context.
+    programs.extend(
+        {
+            "name": _qualified(s.name, s.owner, multi),
+            "kind": s.kind.value,
+            "does": s.summary,
+            "tables_used": s.tables_used,
+        }
+        for key, s in sem_by_unit.items()
+        if key not in seen_units
+    )
 
     log_tables = [
         {
@@ -332,11 +382,19 @@ def build_ask_prompt(
             "latest query; build on its SQL when it is a follow-up):\n"
             f"{_history_block(history)}\n\n"
         )
+    # Naming the language explicitly, right next to the question, works where the generic
+    # "answer in the user's language" rule in the system prompt does not: a small local model
+    # follows a concrete instruction in the user turn far more reliably than a policy up top.
+    language = (
+        "Romanian (romana)" if _looks_romanian(question) else "the same language as the question"
+    )
     return (
         f"Database map (semantic, PII-safe JSON):\n{context}\n\n"
         f"Catalog views (for questions about the database itself):\n{catalog}\n\n"
         f"{convo}"
         f"Business question:\n{question.strip()}\n\n"
+        f"Write \"explanation\" and \"assumptions\" in {language}. The SQL itself stays in "
+        "English/Oracle syntax.\n\n"
         f"{_ASK_OUTPUT_CONTRACT}"
     )
 
@@ -377,6 +435,153 @@ def with_row_limit(sql: str, max_rows: int) -> str:
     """Wrap a validated SELECT so at most `max_rows` rows come back (Oracle ROWNUM, order-safe)."""
     n = max(1, int(max_rows))
     return f"SELECT * FROM (\n{sql}\n) WHERE ROWNUM <= {n}"
+
+
+# --------------------------------------------------- program lookup safety net
+
+# "Is there a get_balance procedure?" must be answered from the MAP, not with a catalog query:
+# a packaged routine is not an object in ALL_OBJECTS, so a name search there returns zero rows and
+# the user reads that as "it doesn't exist". The map already holds the answer (which package, which
+# owner, and what the unit does), so we answer it directly and deterministically — prompt guidance
+# alone did not hold. Only a POSITIVE match short-circuits: if the name is not in the map we say
+# nothing and let the model query the catalog, since the map covers only the scanned schemas.
+
+_LOOKUP_INTENT = (
+    "exist", "is there", "are there", "do we have", "do you have", "where is", "where does",
+    "which package", "what does", "what do", "find the", "look for",
+    "exista", "există", "avem", "unde", "ce face", "ce fac", "in ce pachet", "în ce pachet",
+    "care pachet", "gaseste", "găsește", "cauta", "caută",
+)
+
+# Romanian markers. A diacritic or one unmistakably-Romanian word is enough; the weaker words
+# (short, or shared with other languages) only count when at least two of them show up.
+_RO_DIACRITICS = "ăâîșşțţ"
+_RO_STRONG = frozenset({
+    "exista", "unde", "avem", "pachetul", "procedura", "proceduri", "functia", "functie",
+    "cate", "cati", "cine", "afla", "gaseste", "cauta", "despre",
+})
+_RO_WEAK = frozenset({"ce", "face", "fac", "care", "din", "sunt", "este", "cum", "se", "in", "si"})
+
+
+def _looks_romanian(question: str) -> bool:
+    q = question.lower()
+    if any(ch in q for ch in _RO_DIACRITICS):
+        return True
+    words = set(re.findall(r"[a-z]+", q))
+    if words & _RO_STRONG:
+        return True
+    return len(words & _RO_WEAK) >= 2
+
+
+_KIND_RO = {
+    ProgramKind.PROCEDURE: "procedură",
+    ProgramKind.FUNCTION: "funcție",
+    ProgramKind.PACKAGE: "pachet",
+    ProgramKind.TRIGGER: "declanșator (trigger)",
+    ProgramKind.VIEW: "vedere (view)",
+}
+_KIND_EN = {
+    ProgramKind.PROCEDURE: "procedure",
+    ProgramKind.FUNCTION: "function",
+    ProgramKind.PACKAGE: "package",
+    ProgramKind.TRIGGER: "trigger",
+    ProgramKind.VIEW: "view",
+}
+
+
+class _ProgramHit(BaseModel):
+    """One program unit (or packaged routine) the question named."""
+
+    name: str
+    kind: ProgramKind
+    owner: str | None = None
+    package: str | None = None  # set when the routine lives inside a package
+    summary: str = ""
+
+
+def _program_candidates(report: ScanReport) -> list[_ProgramHit]:
+    sem = {(s.owner, s.name, s.kind): s.summary for s in report.program_semantics}
+    hits: list[_ProgramHit] = []
+    for unit in report.schema_info.program_units:
+        summary = sem.get((unit.owner, unit.name, unit.kind), "")
+        hits.append(
+            _ProgramHit(name=unit.name.upper(), kind=unit.kind, owner=unit.owner, summary=summary)
+        )
+        if unit.kind == ProgramKind.PACKAGE:
+            hits.extend(
+                _ProgramHit(
+                    name=routine,
+                    kind=kind,
+                    owner=unit.owner,
+                    package=unit.name.upper(),
+                    # The package's summary is the best description we have of a routine inside it.
+                    summary=summary,
+                )
+                for routine, kind in declared_subprograms(unit.source)
+            )
+    return hits
+
+
+def _qualify(owner: str | None, name: str) -> str:
+    return f"{owner}.{name}" if owner else name
+
+
+def _describe_hit(hit: _ProgramHit, romanian: bool) -> str:
+    where = _qualify(hit.owner, hit.package) if hit.package else _qualify(hit.owner, hit.name)
+    if romanian:
+        kind = _KIND_RO[hit.kind]
+        text = (
+            f"Da — {hit.name} există: e o {kind} din pachetul {where}."
+            if hit.package
+            else f"Da — {hit.name} există: e o {kind} din schema {hit.owner or 'scanată'}."
+        )
+        if hit.summary:
+            lead = "Pachetul din care face parte" if hit.package else "Ce face"
+            text += f" {lead}: {hit.summary}"
+        else:
+            text += " Nu am un rezumat pentru el (scanarea a rulat fără model)."
+        return text
+    kind = _KIND_EN[hit.kind]
+    text = (
+        f"Yes — {hit.name} exists: it is a {kind} inside the package {where}."
+        if hit.package
+        else f"Yes — {hit.name} exists: it is a {kind} in {hit.owner or 'the scanned schema'}."
+    )
+    if hit.summary:
+        lead = "Its package" if hit.package else "What it does"
+        text += f" {lead}: {hit.summary}"
+    else:
+        text += " There is no summary for it (the scan ran without a model)."
+    return text
+
+
+def answer_program_lookup(question: str, report: ScanReport) -> AskResult | None:
+    """Answer "does X exist / where is X / what does X do" straight from the map, or return None.
+
+    Returns a ready AskResult with `sql=""` (nothing to run) when the question names a program
+    unit or a packaged routine the map knows; None when it doesn't, so the model still gets its
+    turn. Deterministic, so it holds whatever model is configured — and it costs no model call.
+    """
+    q = question.lower()
+    if not any(w in q for w in _LOOKUP_INTENT):
+        return None
+    tokens = {t.upper() for t in re.findall(r"[A-Za-z][A-Za-z0-9_$#]*", question)}
+    # Longest name first, so "CORE_BANKING.GET_BALANCE" prefers the routine over its package.
+    matches = [h for h in _program_candidates(report) if h.name in tokens]
+    if not matches:
+        return None
+    hit = max(matches, key=lambda h: (h.package is not None, len(h.name)))
+    romanian = _looks_romanian(question)
+    return AskResult(
+        sql="",
+        explanation=_describe_hit(hit, romanian),
+        assumptions=[
+            "Răspuns din harta scanată, fără a interoga baza de date."
+            if romanian
+            else "Answered from the scanned map, without querying the database."
+        ],
+        confidence=ConfidenceLevel.HIGH,
+    )
 
 
 # --------------------------------------------------- error-severity safety net
@@ -453,19 +658,27 @@ def enforce_error_severity_filter(
             continue
         if _already_filters_severity(result.sql, sev):
             return result
+        romanian = _looks_romanian(question)
+        levels = ", ".join(ERROR_SEVERITIES)
         if _is_simple_select(result.sql):
             result.sql = _inject_severity_filter(result.sql, sev)
-            result.assumptions = [
-                *result.assumptions,
-                f"Restricted to error severities ({', '.join(ERROR_SEVERITIES)}) — ask for "
-                "'all entries' to include INFO/WARN rows too.",
-            ]
+            note = (
+                f"Limitat la severitatile de eroare ({levels}) — cere 'toate intrarile' ca sa "
+                "incluzi si randurile INFO/WARN."
+                if romanian
+                else f"Restricted to error severities ({levels}) — ask for 'all entries' to "
+                "include INFO/WARN rows too."
+            )
         else:
-            result.assumptions = [
-                *result.assumptions,
-                f"Heads up: this did not filter {sev} to error levels, so INFO/WARN rows may be "
-                f"included. Add UPPER({sev}) IN (...) or use `blossa logs` for errors only.",
-            ]
+            note = (
+                f"Atentie: interogarea nu a filtrat {sev} la nivelurile de eroare, deci pot "
+                f"aparea si randuri INFO/WARN. Adauga UPPER({sev}) IN (...) sau foloseste "
+                "`blossa logs` doar pentru erori."
+                if romanian
+                else f"Heads up: this did not filter {sev} to error levels, so INFO/WARN rows may "
+                f"be included. Add UPPER({sev}) IN (...) or use `blossa logs` for errors only."
+            )
+        result.assumptions = [*result.assumptions, note]
         return result
     return result
 

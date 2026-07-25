@@ -11,15 +11,44 @@
   <header>
     <div class="brand">🌸 <strong>Blossa</strong> <span id="schema-name" class="muted"></span></div>
     <nav class="tabs">
-      <button class="tab active" data-tab="ask">Ask</button>
+      <button class="tab active" data-tab="sql">SQL</button>
+      <button class="tab" data-tab="ask">Ask</button>
       <button class="tab" data-tab="schema">Schema</button>
       <button class="tab" data-tab="logic">Logic</button>
       <button class="tab" data-tab="logs">Logs</button>
     </nav>
   </header>
 
+  <!-- SQL WORKSPACE ---------------------------------------------------------->
+  <main id="tab-sql" class="tab-panel active">
+    <div class="ws-layout">
+      <aside class="ws-tree-pane">
+        <input id="ws-search" type="text"
+               placeholder="Search tables, views, packages, sequences…" autocomplete="off" />
+        <div id="ws-tree" class="ws-tree"></div>
+      </aside>
+      <section class="ws-main">
+        <form id="ws-ask-bar" class="ws-ask-bar">
+          <input id="ws-ask" type="text" autocomplete="off"
+                 placeholder="Ask AI to write the SQL, e.g. total sales per month…" />
+          <button type="submit" id="ws-ask-btn">AI ▸</button>
+        </form>
+        <div class="ws-editor-head">
+          <span class="muted small">SQL editor · Ctrl/⌘+Enter to run · read-only, results shown here only</span>
+          <button id="ws-run-btn" type="button">Run ▸</button>
+        </div>
+        <textarea id="ws-sql" class="ws-sql" spellcheck="false"
+                  placeholder="Click a table to preview it, or write SQL here…"></textarea>
+        <div id="ws-ask-note" class="muted small"></div>
+        <div id="ws-detail" class="ws-detail hidden"></div>
+        <div id="ws-status" class="status"></div>
+        <div id="ws-results" class="ws-results"></div>
+      </section>
+    </div>
+  </main>
+
   <!-- ASK -------------------------------------------------------------------->
-  <main id="tab-ask" class="tab-panel active">
+  <main id="tab-ask" class="tab-panel">
     <form id="ask-form" class="ask-bar">
       <input id="question" type="text" autocomplete="off"
              placeholder="Ask in plain language, e.g. how many employees per department?" />
@@ -30,11 +59,17 @@
       The model sees only the schema map — never your data. Ask a follow-up to refine the last
       query (e.g. “now break it down by year”). The SQL below is what will run; you can edit it.
       Queries are read-only; results are shown here only and never sent to the model.
+      Ask for a <em>procedure, view or index</em> instead (“write me a procedure like
+      get_balance but only for active accounts”) and you get the code — reviewed by you, never
+      run by Blossa.
     </p>
 
     <div id="thread"></div>
 
     <div id="ask-status" class="status"></div>
+
+    <!-- Generated code (a "write me a procedure…" answer). Never runnable from here. -->
+    <section id="generated" class="hidden"></section>
 
     <section id="answer" class="hidden">
       <p id="current-question" class="current-question"></p>

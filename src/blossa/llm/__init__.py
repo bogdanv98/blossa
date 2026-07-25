@@ -18,9 +18,9 @@ from .http_provider import OllamaProvider, OpenAICompatibleProvider
 def get_provider(config: LLMConfig) -> LLMProvider:
     provider = config.provider.lower()
     if provider == "ollama":
-        return OllamaProvider(config.ollama)
+        return OllamaProvider(config.ollama, config.language)
     if provider == "openai_compatible":
-        return OpenAICompatibleProvider(config.openai_compatible)
+        return OpenAICompatibleProvider(config.openai_compatible, config.language)
     if provider == "heuristic":
         return HeuristicProvider()
     raise ValueError(

@@ -18,6 +18,11 @@ llm:
   # provider: "ollama" | "heuristic" | "openai_compatible"
   # "heuristic" runs fully offline with no model — useful for CI / a first run.
   provider: "ollama"
+  # Language the map is WRITTEN in: table purposes, column meanings, program summaries.
+  # "en" (default) or e.g. "ro". Table/column names and SQL are never translated. Applies to the
+  # next scan; an existing map keeps the language it was written in. `ask` is separate — it
+  # replies in whatever language the question was asked in.
+  language: "en"
   ollama:
     base_url: "http://localhost:11434"
     model: "qwen2.5:14b"

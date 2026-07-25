@@ -13,6 +13,7 @@ from blossa.models import (
 from blossa.nlquery import build_ask_prompt, build_schema_context
 from blossa.program import (
     build_program_prompt,
+    package_subprograms,
     parse_program_response,
     run_program_pass,
     trim_source,
@@ -156,3 +157,32 @@ def test_ask_prompt_instructs_plain_language_logic_answers():
 
     assert "plain language" in ASK_SYSTEM_PROMPT.lower()
     assert "programs" in ASK_SYSTEM_PROMPT.lower()
+
+
+def test_package_subprograms_reads_the_spec_only():
+    source = """PACKAGE core_banking AS
+   FUNCTION get_balance(p_account_id IN NUMBER) RETURN NUMBER;
+   PROCEDURE deposit(p_account_id IN NUMBER, p_amount IN NUMBER);
+   FUNCTION get_balance(p_account_id IN NUMBER, p_at IN DATE) RETURN NUMBER;  -- overload
+END core_banking;PACKAGE BODY core_banking AS
+   FUNCTION money(p_amount IN NUMBER) RETURN NUMBER IS BEGIN RETURN p_amount; END money;
+END core_banking;"""
+    # Declared (callable) routines only, de-duplicated across overloads, in declaration order.
+    assert package_subprograms(source) == ["GET_BALANCE", "DEPOSIT"]
+
+
+def test_package_subprograms_is_empty_without_a_spec():
+    assert package_subprograms("") == []
+    assert package_subprograms("PROCEDURE standalone IS BEGIN NULL; END;") == ["STANDALONE"]
+
+
+def test_program_prompt_asks_for_the_configured_language():
+    prompt = build_program_prompt(_PROC, language="ro")
+    assert "Romanian" in prompt
+    # Identifiers must survive a translated map, or it stops matching the database.
+    assert "Do NOT translate table names" in prompt
+
+
+def test_program_prompt_says_nothing_about_language_for_english():
+    assert "Romanian" not in build_program_prompt(_PROC, language="en")
+    assert "Write every text" not in build_program_prompt(_PROC)

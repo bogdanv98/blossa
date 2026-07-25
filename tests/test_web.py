@@ -143,6 +143,183 @@ def test_map_view_includes_log_tables_with_roles():
     assert {c["role"] for c in lt["columns"]} == {"event_time", "message"}
 
 
+def test_map_view_lists_program_objects_with_source():
+    # The SQL-workspace object browser needs every view/package/proc — sourced from program_units
+    # (so they appear even without a model) — each with its source, plus the AI summary joined in.
+    from blossa.models import ProgramKind, ProgramSemantics, ProgramUnit
+
+    report = _report()
+    report.schema_info.program_units.append(
+        ProgramUnit(name="EMP_V", owner="HR", kind=ProgramKind.VIEW,
+                    source="SELECT * FROM EMPLOYEES")
+    )
+    report.schema_info.program_units.append(
+        ProgramUnit(name="RAW_PKG", owner="HR", kind=ProgramKind.PACKAGE,
+                    source="PACKAGE RAW_PKG AS ... END;")
+    )
+    report.program_semantics.append(
+        ProgramSemantics(name="EMP_V", owner="HR", kind=ProgramKind.VIEW,
+                         summary="Employee view", tables_used=["EMPLOYEES"],
+                         confidence=ConfidenceLevel.HIGH)
+    )
+    view = build_map_view(report)
+    progs = {p["name"]: p for p in view["programs"]}
+    assert progs["EMP_V"]["kind"] == "VIEW"
+    assert progs["EMP_V"]["source"] == "SELECT * FROM EMPLOYEES"
+    assert progs["EMP_V"]["summary"] == "Employee view"  # semantics joined in
+    # A unit with no semantics still shows up (empty summary), so the object exists in the tree.
+    assert progs["RAW_PKG"]["source"].startswith("PACKAGE") and progs["RAW_PKG"]["summary"] == ""
+
+
+def test_map_view_lists_other_catalog_objects():
+    # Sequences/synonyms/etc. have no model of their own — they reach the browser through the
+    # object catalog. Tables and program units are not repeated there.
+    from blossa.models import CatalogObject
+
+    report = _report()
+    report.schema_info.objects.extend([
+        CatalogObject(name="ORDER_SEQ", owner="BLOSSA_DEMO", type="SEQUENCE", status="VALID"),
+        CatalogObject(name="CUSTOMERS", owner="BLOSSA_DEMO", type="TABLE", status="VALID"),
+    ])
+    view = build_map_view(report)
+    types = {o["type"] for o in view["other_objects"]}
+    assert types == {"SEQUENCE"}  # the TABLE already has a rich entry
+    assert view["other_objects"][0]["name"] == "ORDER_SEQ"
+
+
+def test_map_view_marks_invalid_program_units():
+    from blossa.models import CatalogObject, ProgramKind, ProgramUnit
+
+    report = _report()
+    report.schema_info.program_units.append(
+        ProgramUnit(name="BROKEN_PKG", owner="HR", kind=ProgramKind.PACKAGE, source="PACKAGE ...")
+    )
+    report.schema_info.objects.append(
+        CatalogObject(name="BROKEN_PKG", owner="HR", type="PACKAGE", status="INVALID")
+    )
+    progs = {p["name"]: p for p in build_map_view(report)["programs"]}
+    assert progs["BROKEN_PKG"]["status"] == "INVALID"
+
+
+class _FakeLob:
+    """Mimics an oracledb LOB locator: readable only while its connection is still open."""
+
+    def __init__(self, text, db):
+        self._text = text
+        self._db = db
+
+    def read(self):
+        if self._db.closed:
+            raise RuntimeError("DPY-1001: not connected to database")
+        return self._text
+
+
+class _DdlDB(_FakeDB):
+    """GET_DDL returns a CLOB — the endpoint must read it before leaving the with-block."""
+
+    closed = False
+
+    def __enter__(self):
+        self.closed = False
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+    def query(self, sql, binds=None):
+        if "GET_DDL" in sql.upper():
+            text = f"\n  CREATE TABLE {binds['owner']}.{binds['name']} (X NUMBER)\n"
+            return [{"DDL": _FakeLob(text, self)}]
+        return super().query(sql, binds)
+
+
+def test_ddl_endpoint_returns_oracles_own_ddl():
+    settings = Settings()
+    settings.llm.provider = "ollama"
+    app = create_app(settings, _report(), provider=_FakeProvider(), db_factory=lambda: _DdlDB())
+    r = TestClient(app).post("/api/ddl", json={"name": "HR.CUSTOMERS", "type": "TABLE"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["source"] == "database"
+    assert data["ddl"] == "CREATE TABLE HR.CUSTOMERS (X NUMBER)"
+
+
+def test_ddl_endpoint_falls_back_to_the_scanned_map():
+    # No DBMS_METADATA (no privilege, or no live DB): the workspace still shows a CREATE TABLE
+    # rebuilt from what the scan captured, clearly labelled as coming from the scan.
+    class _NoMetadata(_FakeDB):
+        def query(self, sql, binds=None):
+            raise RuntimeError("ORA-31603: object not found")
+
+    settings = Settings()
+    settings.llm.provider = "ollama"
+    app = create_app(settings, _report(), provider=_FakeProvider(),
+                     db_factory=lambda: _NoMetadata())
+    data = TestClient(app).post("/api/ddl", json={"name": "CUSTOMERS", "type": "TABLE"}).json()
+    assert data["source"] == "scan"
+    assert "CREATE TABLE CUSTOMERS (" in data["ddl"]
+    assert "EMAIL" in data["ddl"]
+
+
+def test_ddl_endpoint_rejects_a_non_identifier_name():
+    r = _client().post("/api/ddl", json={"name": "CUSTOMERS; DROP TABLE X", "type": "TABLE"})
+    assert r.status_code == 400
+
+
+def test_ddl_endpoint_404s_when_nothing_is_known():
+    r = _client().post("/api/ddl", json={"name": "NO_SUCH_THING", "type": "SEQUENCE"})
+    assert r.status_code == 404
+
+
+class _CodeProvider:
+    """Answers with a code proposal, and records the system prompt it was handed."""
+
+    name = "ollama"
+    model = "fake"
+
+    def __init__(self):
+        self.system_prompts = []
+
+    def generate(self, system_prompt, user_prompt):
+        self.system_prompts.append(system_prompt)
+        return (
+            '{"code": "CREATE OR REPLACE PROCEDURE active_balance IS BEGIN NULL; END;",'
+            ' "object_type": "PROCEDURE", "object_name": "ACTIVE_BALANCE",'
+            ' "explanation": "returns the balance of active accounts only",'
+            ' "assumptions": ["status ACTIVE means open"], "confidence": "high"}'
+        )
+
+
+def test_ask_returns_code_for_a_build_request():
+    provider = _CodeProvider()
+    r = _client(provider).post(
+        "/api/ask", json={"question": "write me a procedure like get_balance for active accounts"}
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["kind"] == "code"
+    assert data["code"].startswith("CREATE OR REPLACE PROCEDURE")
+    assert data["object_name"] == "ACTIVE_BALANCE"
+    assert "sql" not in data  # nothing here is runnable, so no SQL field to hand to /api/run
+    assert "code" in provider.system_prompts[0].lower()  # the codegen prompt, not the ask one
+
+
+def test_ask_still_returns_sql_for_a_question():
+    data = _client().post("/api/ask", json={"question": "how many customers?"}).json()
+    assert data["kind"] == "sql"
+    assert data["sql"].startswith("SELECT COUNT(*)")
+
+
+def test_generated_ddl_is_still_refused_by_the_run_endpoint():
+    # The safety property: even if generated code were posted to /api/run, it cannot execute.
+    r = _client().post(
+        "/api/run",
+        json={"sql": "CREATE OR REPLACE PROCEDURE active_balance IS BEGIN NULL; END;"},
+    )
+    assert r.status_code == 400
+
+
 def _log_report():
     report = _report()
     report.log_tables.append(
@@ -241,3 +418,19 @@ def test_index_page_served():
     r = _client().get("/")
     assert r.status_code == 200
     assert "Blossa" in r.text
+
+
+def test_index_page_has_sql_workspace():
+    # Milestone 1: the SQL workspace (object tree + editor + result grid) is the default surface.
+    html = _client().get("/").text
+    assert 'data-tab="sql"' in html  # the workspace tab exists
+    assert 'id="ws-sql"' in html  # the SQL editor textarea
+    assert 'id="ws-tree"' in html  # the object browser tree
+
+
+def test_static_app_js_served():
+    r = _client().get("/static/app.js")
+    assert r.status_code == 200
+    assert "renderGrid" in r.text  # shared sortable/exportable result grid
+    assert "other_objects" in r.text  # sequences/synonyms/… folders in the object tree
+    assert "/api/ddl" in r.text  # the DDL viewer

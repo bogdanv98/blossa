@@ -93,6 +93,49 @@ def _app_orders():
     )
 
 
+def _transactions():
+    # BANKDEMO.TRANSACTIONS — a money ledger with a timestamp + a short note. Shape-wise it looks
+    # loggy (created_at + note + status), but the amounts + FK make it a business record, not a log.
+    return TableInfo(
+        name="TRANSACTIONS",
+        owner="BANKDEMO",
+        columns=[
+            _col("TXN_ID", "NUMBER"),
+            _col("ACCOUNT_ID", "NUMBER"),
+            _col("TXN_TYPE", "VARCHAR2", 16),
+            _col("AMOUNT", "NUMBER"),
+            _col("BALANCE_AFTER", "NUMBER"),
+            _col("COUNTERPARTY_ACCT", "NUMBER"),
+            _col("STATUS", "VARCHAR2", 12),
+            _col("CREATED_AT", "TIMESTAMP"),
+            _col("NOTE", "VARCHAR2", 200),
+        ],
+        constraints=[_pk("TXN_ID"), _fk(["ACCOUNT_ID"], "ACCOUNTS", ["ACCOUNT_ID"])],
+    )
+
+
+def test_transactions_ledger_is_not_a_log():
+    # Regression: a business ledger (money columns + FK) must not be flagged as a log even though
+    # it has created_at + note + status. Both defenses apply: NOTE is no longer a hard message
+    # keyword, and the ledger guard vetoes a non-loggy money+FK table.
+    assert classify_table(_transactions()) is None
+
+
+def test_short_note_alone_is_not_a_message():
+    # A timestamp plus a SHORT note (no wide free-text column) is not enough to be a log.
+    t = TableInfo(
+        name="ORDER_EVENTS",
+        owner="APP",
+        columns=[
+            _col("ID", "NUMBER"),
+            _col("CREATED_AT", "TIMESTAMP"),
+            _col("NOTE", "VARCHAR2", 200),
+        ],
+        constraints=[_pk("ID")],
+    )
+    assert classify_table(t) is None
+
+
 def _roles(log_table):
     return {lc.role: lc.column for lc in log_table.columns}
 

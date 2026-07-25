@@ -53,10 +53,13 @@ _TIME_WORDS = {
     "EVENT", "WHEN", "STARTED", "FINISHED", "ENDED", "START", "END", "AT",
 }
 _MESSAGE_WORDS = {
-    "MESSAGE", "MSG", "TEXT", "DESCRIPTION", "DESC", "DETAIL", "DETAILS", "REASON", "NOTE", "NOTES",
-    "COMMENT", "COMMENTS", "INFO", "STACK", "STACKTRACE", "EXCEPTION", "BODY", "CONTENT", "PAYLOAD",
-    "ERRTEXT",
+    "MESSAGE", "MSG", "TEXT", "DESCRIPTION", "DESC", "DETAIL", "DETAILS", "REASON",
+    "INFO", "STACK", "STACKTRACE", "EXCEPTION", "BODY", "CONTENT", "PAYLOAD", "ERRTEXT",
 }
+# NOTE/COMMENT are deliberately NOT hard message keywords: a business table (an order, a
+# transaction ledger) routinely carries a short note/comment, and treating that as a log
+# "message" made ledgers look like logs. They still count as a message via the wide-column
+# fallback below when the column is actually free-text-sized (a genuine log message is wide).
 _SEVERITY_WORDS = {
     "SEVERITY", "LEVEL", "LOGLEVEL", "STATUS", "STATE", "OUTCOME", "RESULT", "PRIORITY",
 }
@@ -66,6 +69,11 @@ _SOURCE_WORDS = {
 }
 _ACTOR_WORDS = {"USER", "USERNAME", "DBUSER", "OSUSER", "ACTOR", "WHO", "LOGIN", "ACCOUNT"}
 _CODE_WORDS = {"CODE", "SQLCODE", "ERRCODE", "ERRORCODE", "RC", "RETURNCODE", "STATUSCODE"}
+# Money columns mark a business ledger (a transaction/account/invoice row), never a log entry.
+_MONETARY_WORDS = {
+    "AMOUNT", "AMT", "BALANCE", "PRICE", "COST", "TOTAL", "SUBTOTAL", "DEBIT", "CREDIT",
+    "PRINCIPAL", "PAYMENT", "FEE", "TAX", "CHARGE", "SALARY", "QTY", "QUANTITY",
+}
 
 _DATE_TYPES = {"DATE", "TIMESTAMP"}  # plus any "TIMESTAMP(…) WITH …" handled by startswith
 _NUM_TYPES = {"NUMBER", "INTEGER", "INT", "FLOAT", "DECIMAL", "NUMERIC"}
@@ -86,6 +94,10 @@ def _is_date(col: ColumnInfo) -> bool:
 
 def _is_numeric(col: ColumnInfo) -> bool:
     return col.data_type.upper() in _NUM_TYPES
+
+
+def _is_monetary(col: ColumnInfo) -> bool:
+    return _is_numeric(col) and bool(_tokens(col.name) & _MONETARY_WORDS)
 
 
 def _is_business_ref(col: ColumnInfo, table: TableInfo) -> bool:
@@ -158,6 +170,15 @@ def classify_table(table: TableInfo) -> LogTable | None:
     score = sum((has_time, has_message, has_severity, has_source))
     is_log = (has_time and has_message) or (loggy and score >= 3)
     if not is_log:
+        return None
+
+    # Ledger guard: a table whose name gives no log signal but which carries money columns AND a
+    # business reference (an FK / *_ID) is a business record — a transactions ledger, an invoice,
+    # an account line — that merely happens to have a timestamp and a note. It qualified only on
+    # the shape branch; veto it so a real business table is never mistaken for a log.
+    has_money = any(_is_monetary(c) for c in table.columns)
+    has_biz_ref = any(lc.role is LogRole.BUSINESS_REF for lc in log_columns)
+    if not loggy and has_money and has_biz_ref:
         return None
 
     if loggy and has_time and has_message:

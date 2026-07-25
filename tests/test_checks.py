@@ -375,3 +375,52 @@ def test_cross_schema_fks_inferred_when_both_schemas_in_scope():
     rep = next(r for r in relationships if r.from_columns == ["REP_ID"])
     assert rep.cross_schema and rep.from_owner == "EXT" and rep.to_owner == "HR"
     assert any("cross-schema" in e for e in rep.evidence)
+
+
+# --------------------------------------------------------- empty tables cost no round trips
+
+
+class _CountingDB:
+    """Answers full overlap, and counts how many queries the checks actually send."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def query(self, sql: str, binds=None):
+        self.calls += 1
+        return [{"DISTINCT_TOTAL": 5, "MATCHED": 5, "ORPHAN_ROWS": 0}]
+
+
+def _profiled(table: TableInfo, rows: int) -> TableInfo:
+    from blossa.models import ColumnProfile
+
+    for col in table.columns:
+        table.profiles[col.name] = ColumnProfile(total_rows=rows)
+    return table
+
+
+def test_overlap_skips_tables_profiling_measured_as_empty():
+    # At scale (thousands of empty tables sharing column names) the overlap stage degenerates
+    # into round trips whose outcome is already known: an empty side always drops the candidate.
+    schema = _hr_like_schema()
+    for table in schema.tables:
+        _profiled(table, 0)
+    db = _CountingDB()
+    relationships, _ = run_checks(schema, db=db, owner="HR")
+    assert db.calls == 0, "no overlap query may run against known-empty tables"
+    assert not [r for r in relationships if not r.declared]  # same outcome the queries would give
+
+
+def test_overlap_still_queries_tables_with_rows_or_without_profiles():
+    # Rows present -> the data must decide; profiling skipped -> "unknown" must stay cautious.
+    with_rows = _hr_like_schema()
+    for table in with_rows.tables:
+        _profiled(table, 42)
+    db1 = _CountingDB()
+    run_checks(with_rows, db=db1, owner="HR")
+    assert db1.calls > 0
+
+    unprofiled = _hr_like_schema()
+    db2 = _CountingDB()
+    run_checks(unprofiled, db=db2, owner="HR")
+    assert db2.calls > 0

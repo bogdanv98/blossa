@@ -17,11 +17,12 @@ the endpoints can be tested without a live model or database.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -266,9 +267,15 @@ def create_app(
             state["provider"] = get_provider(settings.llm)
         return state["provider"]
 
+    # The map is immutable for the lifetime of the server, and at scale the view is expensive to
+    # rebuild AND to re-serialize (4000 tables -> ~4 MB, ~3 s per request). Both are paid once.
+    map_json_cache: dict[str, str] = {}
+
     @app.get("/api/map")
-    def get_map() -> dict:
-        return build_map_view(report)
+    def get_map() -> Response:
+        if "json" not in map_json_cache:
+            map_json_cache["json"] = json.dumps(build_map_view(report), default=str)
+        return Response(content=map_json_cache["json"], media_type="application/json")
 
     @app.post("/api/ask")
     def post_ask(body: AskBody) -> dict:

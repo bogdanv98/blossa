@@ -650,13 +650,14 @@ def _answer_usage(
         if u.kind == ProgramKind.PACKAGE:
             details = []
             for routine in routines_referencing(u.source, name):
-                does = sem.routine_summary(routine) if sem else ""
+                # The sentence joins a list that ends with our own period — drop its final dot.
+                does = (sem.routine_summary(routine) if sem else "").rstrip(".")
                 details.append(f"{routine} — {does}" if does else routine)
             if details:
                 inside = "în rutinele" if romanian else "in routines"
                 label += f", {inside}: " + "; ".join(details)
         elif sem and sem.summary:
-            label += f" — {sem.summary}"
+            label += f" — {sem.summary.rstrip('.')}"
         users.append(label)
 
     if users:

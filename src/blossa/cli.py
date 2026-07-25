@@ -320,25 +320,26 @@ def _answer_ask_turn(
     # not a query, and it is printed for review — never executed.
     if is_code_request(question):
         return _write_code(question, report, provider, settings, history=history, strict=strict)
-    # Some questions the map already answers ("is there a get_balance procedure?"). Answering them
-    # here is deterministic, instant, and avoids a catalog query that could not find the routine.
-    known = answer_program_lookup(question, report)
-    if known is not None:
-        return known
-    _status("Translating your question to SQL ...")
-    try:
-        prompt = build_ask_prompt(
-            question, report, use_dba=settings.oracle.use_dba_catalog, history=history
-        )
-        raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
-    except Exception as exc:  # noqa: BLE001
-        err.print(f"[bold red]The model call failed:[/bold red] {exc}")
-        if strict:
-            raise typer.Exit(code=1) from exc
-        return None
-    result = parse_ask_response(raw)
-    result = enforce_error_severity_filter(question, result, report)
-    result = expand_count_to_list(question, result)
+    # Some questions the map already answers ("is there a get_balance procedure?", "is it used
+    # anywhere?"). Deterministic and instant — and the answer then flows through the SAME print/
+    # run path as a model answer, so a usage query really executes and an explanation really
+    # prints (returning early here used to silently swallow both).
+    result = answer_program_lookup(question, report, use_dba=settings.oracle.use_dba_catalog)
+    if result is None:
+        _status("Translating your question to SQL ...")
+        try:
+            prompt = build_ask_prompt(
+                question, report, use_dba=settings.oracle.use_dba_catalog, history=history
+            )
+            raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
+        except Exception as exc:  # noqa: BLE001
+            err.print(f"[bold red]The model call failed:[/bold red] {exc}")
+            if strict:
+                raise typer.Exit(code=1) from exc
+            return None
+        result = parse_ask_response(raw)
+        result = enforce_error_severity_filter(question, result, report)
+        result = expand_count_to_list(question, result)
 
     if not result.answerable:
         # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from

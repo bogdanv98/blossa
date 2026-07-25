@@ -295,7 +295,9 @@ def create_app(
             return {"kind": "code", **parse_codegen_response(raw, report).model_dump()}
         # "Is there a get_balance procedure?" is answerable from the map alone — and answering it
         # there is both correct and instant, where a generated catalog query can be neither.
-        known = answer_program_lookup(question, report)
+        known = answer_program_lookup(
+            question, report, use_dba=settings.oracle.use_dba_catalog
+        )
         if known is not None:
             return {"kind": "sql", **known.model_dump()}
         prov = _ensure_provider()

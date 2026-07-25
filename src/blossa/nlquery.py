@@ -457,9 +457,24 @@ def with_row_limit(sql: str, max_rows: int) -> str:
 _LOOKUP_INTENT = (
     "exist", "is there", "are there", "do we have", "do you have", "where is", "where does",
     "which package", "what does", "what do", "find the", "look for",
-    "exista", "există", "avem", "unde", "ce face", "ce fac", "in ce pachet", "în ce pachet",
+    # "unde " keeps its trailing space: "undeva" (anywhere) must not read as "unde" (where).
+    "exista", "există", "avem", "unde ", "ce face", "ce fac", "in ce pachet", "în ce pachet",
     "care pachet", "gaseste", "găsește", "cauta", "caută",
 )
+
+# "Is X USED anywhere?" is a different question from "does X exist?" — and answerable: the map
+# carries every captured program source, and Oracle records object-level dependencies in
+# ALL_/DBA_DEPENDENCIES. Answering it with "X exists, here is what it does" is a non-answer.
+_USAGE_INTENT = (
+    "used", "uses", "usage", "referenced", "references", "refers to", "depends on", "depend on",
+    "calls", "called", "invoked", "invokes", "who uses",
+    "foloseste", "folosește", "folosit", "folosita", "folosită", "utilizeaza", "utilizează",
+    "utilizat", "apelat", "apeleaza", "apelează", "referit", "depinde",
+)
+
+
+def _is_usage_question(question: str) -> bool:
+    return any(w in question.lower() for w in _USAGE_INTENT)
 
 # Romanian markers. A diacritic or one unmistakably-Romanian word is enough; the weaker words
 # (short, or shared with other languages) only count when at least two of them show up.
@@ -563,17 +578,23 @@ def _describe_hit(hit: _ProgramHit, romanian: bool) -> str:
     return text
 
 
-def answer_program_lookup(question: str, report: ScanReport) -> AskResult | None:
-    """Answer "does X exist / where is X / what does X do" straight from the map, or return None.
+def answer_program_lookup(
+    question: str, report: ScanReport, use_dba: bool = False
+) -> AskResult | None:
+    """Answer "does X exist / where is X / is X used anywhere" from the map, or return None.
 
-    Returns a ready AskResult with `sql=""` (nothing to run) when the question names a program
-    unit or a packaged routine the map knows; None when it doesn't, so the model still gets its
-    turn. Deterministic, so it holds whatever model is configured — and it costs no model call.
+    Existence gets `sql=""` (the map is the answer); usage gets the units in the map whose source
+    references the object, plus a query over the dependency catalog for objects the map cannot
+    see. None when the question names nothing the map knows, so the model still gets its turn.
+    Deterministic, so it holds whatever model is configured.
     """
     q = question.lower()
-    if not any(w in q for w in _LOOKUP_INTENT):
+    usage = _is_usage_question(q)
+    if not usage and not any(w in q for w in _LOOKUP_INTENT):
         return None
     tokens = {t.upper() for t in re.findall(r"[A-Za-z][A-Za-z0-9_$#]*", question)}
+    if usage:
+        return _answer_usage(question, tokens, report, use_dba)
     # Longest name first, so "CORE_BANKING.GET_BALANCE" prefers the routine over its package.
     matches = [h for h in _program_candidates(report) if h.name in tokens]
     if not matches:
@@ -587,6 +608,87 @@ def answer_program_lookup(question: str, report: ScanReport) -> AskResult | None
             "Răspuns din harta scanată, fără a interoga baza de date."
             if romanian
             else "Answered from the scanned map, without querying the database."
+        ],
+        confidence=ConfidenceLevel.HIGH,
+    )
+
+
+def _answer_usage(
+    question: str, tokens: set[str], report: ScanReport, use_dba: bool
+) -> AskResult | None:
+    """Who uses X: scan the captured sources, and query the dependency catalog when it can help.
+
+    For a table, view or standalone program, ALL_/DBA_DEPENDENCIES is the authoritative answer
+    (it sees objects outside the map), so it becomes the SQL. A packaged routine only ever
+    appears in the catalog as its whole package, so there the source scan is the whole answer.
+    """
+    unit_hits = [h for h in _program_candidates(report) if h.name in tokens]
+    table_hits = [t for t in report.schema_info.tables if t.name.upper() in tokens]
+    if unit_hits:
+        hit = max(unit_hits, key=lambda h: (h.package is not None, len(h.name)))
+        name, owner, packaged = hit.name, hit.owner, hit.package is not None
+        exclude = {name, hit.package or ""}
+    elif table_hits:
+        table = max(table_hits, key=lambda t: len(t.name))
+        name, owner, packaged = table.name.upper(), table.owner, False
+        exclude = {name}
+    else:
+        return None
+
+    users = [
+        f"{(u.owner + '.') if u.owner else ''}{u.name} ({u.kind.value.lower()})"
+        for u in report.schema_info.program_units
+        if u.name.upper() not in exclude
+        and re.search(rf"\b{re.escape(name)}\b", u.source or "", re.IGNORECASE)
+    ]
+    romanian = _looks_romanian(question)
+
+    if users:
+        found = (
+            f"În codul capturat în hartă, {name} este folosit de: {', '.join(users)}."
+            if romanian
+            else f"In the code captured in the map, {name} is used by: {', '.join(users)}."
+        )
+    else:
+        found = (
+            f"{name} nu apare în niciun program capturat în hartă."
+            if romanian
+            else f"{name} is not referenced by any program captured in the map."
+        )
+
+    sql = ""
+    if packaged:
+        found += (
+            " Fiind o rutină dintr-un pachet, catalogul Oracle urmărește dependențele doar la "
+            "nivel de pachet întreg, deci sursa din hartă este răspunsul."
+            if romanian
+            else " Being a packaged routine, Oracle's dependency catalog only tracks the whole "
+            "package, so the captured source is the answer."
+        )
+    else:
+        # The tokens regex guarantees identifier-safe characters, so inlining is safe.
+        view = "DBA_DEPENDENCIES" if use_dba else "ALL_DEPENDENCIES"
+        owner_filter = f"\n   AND REFERENCED_OWNER = '{owner.upper()}'" if owner else ""
+        sql = (
+            f"SELECT OWNER, NAME, TYPE\n  FROM {view}\n"
+            f" WHERE REFERENCED_NAME = '{name}'{owner_filter}\n ORDER BY OWNER, NAME"
+        )
+        found += (
+            " Interogarea de mai jos verifică dependențele înregistrate în catalogul Oracle "
+            "(prinde și obiecte din afara hărții)."
+            if romanian
+            else " The query below checks the dependencies Oracle itself recorded (it also "
+            "catches objects outside the map)."
+        )
+
+    return AskResult(
+        sql=sql,
+        explanation=found,
+        assumptions=[
+            "Sursele din hartă au fost căutate textual; comentariile pot produce potriviri false."
+            if romanian
+            else "The captured sources were searched textually; a mention in a comment would "
+            "also match."
         ],
         confidence=ConfidenceLevel.HIGH,
     )

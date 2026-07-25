@@ -269,6 +269,57 @@ def test_program_lookup_answers_a_romanian_question_in_romanian():
     assert res.assumptions and "harta scanată" in res.assumptions[0]
 
 
+def _usage_report():
+    from blossa.models import ProgramKind, ProgramUnit
+
+    report = _package_report_with_summary()
+    report.schema_info.program_units.append(
+        ProgramUnit(name="EMP_V", owner="HR", kind=ProgramKind.VIEW,
+                    source="SELECT 1 FROM DUAL")
+    )
+    report.schema_info.program_units.append(
+        ProgramUnit(name="PAYROLL_JOB", owner="HR", kind=ProgramKind.PROCEDURE,
+                    source="PROCEDURE payroll_job IS BEGIN\n"
+                           "  INSERT INTO t SELECT * FROM emp_v;\n"
+                           "  v := core_banking.get_balance(1);\nEND;")
+    )
+    return report
+
+
+def test_usage_question_is_not_hijacked_by_the_existence_answer():
+    # The live failure: "se foloseste pe undeva ... EMP_V?" was answered with "EMP_V exists, here
+    # is what it does" — "undeva" (anywhere) matched the intent word "unde" (where).
+    res = answer_program_lookup(
+        "se foloseste pe undeva prin codul din db view-ul EMP_V?", _usage_report()
+    )
+    assert res is not None
+    assert "există:" not in res.explanation  # not the existence answer
+    assert "PAYROLL_JOB" in res.explanation  # the map user, found by the source scan
+    assert "ALL_DEPENDENCIES" in res.sql and "REFERENCED_NAME = 'EMP_V'" in res.sql
+
+
+def test_usage_answer_uses_the_dba_catalog_when_available():
+    res = answer_program_lookup("is EMP_V used anywhere?", _usage_report(), use_dba=True)
+    assert "DBA_DEPENDENCIES" in res.sql
+    assert "REFERENCED_OWNER = 'HR'" in res.sql  # scoped to the view's owner
+
+
+def test_usage_of_a_packaged_routine_is_answered_from_sources_alone():
+    # A packaged routine never appears in the dependency catalog under its own name, so the
+    # source scan is the whole answer and there is nothing to run.
+    res = answer_program_lookup("unde se foloseste get_balance?", _usage_report())
+    assert res is not None and res.sql == ""
+    assert "PAYROLL_JOB" in res.explanation
+    assert "pachet" in res.explanation  # says why there is no query
+
+
+def test_usage_of_an_unreferenced_table_still_checks_the_catalog():
+    res = answer_program_lookup("is CUSTOMERS used anywhere in the code?", _usage_report())
+    assert res is not None
+    assert "not referenced by any program captured in the map" in res.explanation
+    assert "REFERENCED_NAME = 'CUSTOMERS'" in res.sql
+
+
 def test_romanian_is_recognised_from_one_unmistakable_word():
     # "unde se afla X" carries no diacritics, but it is plainly not an English question.
     res = answer_program_lookup("unde se afla transfer_funds?", _package_report_with_summary())

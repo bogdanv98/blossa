@@ -141,6 +141,20 @@ def _name_token(column_name: str) -> str:
     return column_name.rsplit("_", 1)[-1] if "_" in column_name else column_name
 
 
+def _profiled_empty(table) -> bool:
+    """True when profiling MEASURED this table and found zero rows.
+
+    An overlap query against an empty side is a guaranteed no-op — an empty child yields
+    DISTINCT_TOTAL=0 (overlap None), an empty parent yields MATCHED=0 (overlap 0.0) — and either
+    way the candidate is dropped. Knowing that up front matters at scale: on an estate with
+    thousands of empty tables the overlap stage otherwise degenerates into tens of thousands of
+    database round trips that cannot change the result. Only an actual measurement counts: with
+    profiling skipped there are no profiles, the answer is "unknown", and the queries still run.
+    """
+    profiles = table.profiles.values()
+    return bool(profiles) and all(p.total_rows == 0 for p in profiles)
+
+
 def _candidate_foreign_keys(
     schema: SchemaInfo,
     declared: list[Relationship],
@@ -160,6 +174,14 @@ def _candidate_foreign_keys(
     findings: list[Finding] = []
     # (owner, table, column) tuples already paired off, so later passes never double-count them.
     matched_cols: set[tuple[str, str, str]] = set()
+    # Tables profiling measured as empty: overlap against them can only drop the candidate, so
+    # the data-gated passes skip the round trip and drop it directly. Applied only when a DB is
+    # present — offline, the passes never query and their (LOW-confidence) output must not change.
+    known_empty: set[tuple[str, str]] = (
+        {(_table_owner(t, fb), t.name) for t in schema.tables if _profiled_empty(t)}
+        if db is not None
+        else set()
+    )
 
     def emit(
         child_owner: str, table_name: str, from_cols: list[str],
@@ -236,10 +258,13 @@ def _candidate_foreign_keys(
 
     for table in schema.tables:
         co = _table_owner(table, fb)
+        if (co, table.name) in known_empty:
+            continue  # every overlap would return None and drop the candidate anyway
         for col in table.columns:
             cands = [
                 k for k in parents.get(col.name, [])
                 if not (k[0] == co and k[1] == table.name)  # drop the column's own key
+                and (k[0], k[1]) not in known_empty  # empty parent: overlap would be 0
             ]
             if not cands:
                 continue
@@ -296,6 +321,8 @@ def _candidate_foreign_keys(
         own_keys = {(po, pt, pc) for (po, pt, pc, _pb) in key_list}
         for table in schema.tables:
             co = _table_owner(table, fb)
+            if (co, table.name) in known_empty:
+                continue
             for col in table.columns:
                 if (co, table.name, col.name) in matched_cols:
                     continue
@@ -309,6 +336,7 @@ def _candidate_foreign_keys(
                     (po, pt, pc) for (po, pt, pc, pb) in key_list
                     if _name_token(pc) == token and pb == child_base
                     and not (po == co and pt == table.name and pc == col.name)
+                    and (po, pt) not in known_empty
                 ]
                 best2: tuple[float, int, str, str, str] | None = None
                 for po, pt, pc in compatible:
@@ -341,6 +369,8 @@ def _candidate_foreign_keys(
         for po, pt, key_cols in composite_parents:
             if po == co and pt == table.name:
                 continue
+            if (co, table.name) in known_empty or (po, pt) in known_empty:
+                continue  # (db only) the overlap query would drop this candidate anyway
             if not set(key_cols).issubset(col_names):
                 continue  # child lacks one or more of the key's columns
             from_cols = list(key_cols)  # keep the parent key's column order
@@ -376,9 +406,13 @@ def _candidate_foreign_keys(
         tables_by = {(_table_owner(t, fb), t.name): t for t in schema.tables}
         for table in schema.tables:
             co = _table_owner(table, fb)
+            if (co, table.name) in known_empty:
+                continue
             child_names = {c.name for c in table.columns}
             for po, pt, key_cols in composite_parents:
                 if po == co and pt == table.name:
+                    continue
+                if (po, pt) in known_empty:
                     continue
                 if set(key_cols).issubset(child_names):
                     continue  # exact-name composite — pass 3 already handled it

@@ -207,9 +207,9 @@ def test_map_view_lists_a_packages_routines_with_their_kind():
     )
     pkg = next(p for p in build_map_view(report)["programs"] if p["name"].endswith("CORE_BANKING"))
     assert pkg["subprograms"] == [
-        {"name": "GET_BALANCE", "kind": "FUNCTION"},
-        {"name": "DEPOSIT", "kind": "PROCEDURE"},
-    ]  # body-private money() is not callable, so it is not advertised
+        {"name": "GET_BALANCE", "kind": "FUNCTION", "does": ""},
+        {"name": "DEPOSIT", "kind": "PROCEDURE", "does": ""},
+    ]  # body-private money() is not callable, so it is not advertised; no semantics -> no "does"
 
 
 def test_map_view_marks_invalid_program_units():

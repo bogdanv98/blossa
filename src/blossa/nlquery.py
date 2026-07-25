@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from .logsense import ERROR_SEVERITIES
 from .models import ConfidenceLevel, LogRole, ProgramKind, ScanReport
-from .program import declared_subprograms, package_subprograms
+from .program import declared_subprograms, package_subprograms, routines_referencing
 
 # Keywords that must never appear in a query we are about to run. The READ ONLY transaction on the
 # connection is the real backstop; this is defence-in-depth and gives a clearer error message.
@@ -635,19 +635,35 @@ def _answer_usage(
     else:
         return None
 
-    users = [
-        f"{(u.owner + '.') if u.owner else ''}{u.name} ({u.kind.value.lower()})"
-        for u in report.schema_info.program_units
-        if u.name.upper() not in exclude
-        and re.search(rf"\b{re.escape(name)}\b", u.source or "", re.IGNORECASE)
-    ]
     romanian = _looks_romanian(question)
+    sem_by_unit = {(s.owner, s.name, s.kind): s for s in report.program_semantics}
+    users = []
+    for u in report.schema_info.program_units:
+        if u.name.upper() in exclude:
+            continue
+        if not re.search(rf"\b{re.escape(name)}\b", u.source or "", re.IGNORECASE):
+            continue
+        label = f"{(u.owner + '.') if u.owner else ''}{u.name} ({u.kind.value.lower()})"
+        sem = sem_by_unit.get((u.owner, u.name, u.kind))
+        # For a package, name the ROUTINES that touch the object — "the package uses it" is
+        # true but coarse — and say what each routine does when the scan captured that.
+        if u.kind == ProgramKind.PACKAGE:
+            details = []
+            for routine in routines_referencing(u.source, name):
+                does = sem.routine_summary(routine) if sem else ""
+                details.append(f"{routine} — {does}" if does else routine)
+            if details:
+                inside = "în rutinele" if romanian else "in routines"
+                label += f", {inside}: " + "; ".join(details)
+        elif sem and sem.summary:
+            label += f" — {sem.summary}"
+        users.append(label)
 
     if users:
         found = (
-            f"În codul capturat în hartă, {name} este folosit de: {', '.join(users)}."
+            f"În codul capturat în hartă, {name} este folosit de: {'; '.join(users)}."
             if romanian
-            else f"In the code captured in the map, {name} is used by: {', '.join(users)}."
+            else f"In the code captured in the map, {name} is used by: {'; '.join(users)}."
         )
     else:
         found = (

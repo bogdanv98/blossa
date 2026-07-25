@@ -186,3 +186,51 @@ def test_program_prompt_asks_for_the_configured_language():
 def test_program_prompt_says_nothing_about_language_for_english():
     assert "Romanian" not in build_program_prompt(_PROC, language="en")
     assert "Write every text" not in build_program_prompt(_PROC)
+
+
+def test_routines_referencing_points_at_the_right_section():
+    from blossa.program import routines_referencing
+
+    source = """PACKAGE core_banking AS
+   FUNCTION get_balance(p_account_id IN NUMBER) RETURN NUMBER;
+   PROCEDURE apply_monthly_interest;
+   PROCEDURE close_account(p_account_id IN NUMBER);
+END core_banking;PACKAGE BODY core_banking AS
+   FUNCTION get_balance(p_account_id IN NUMBER) RETURN NUMBER IS
+   BEGIN
+      SELECT balance INTO v FROM accounts WHERE account_id = p_account_id;
+   END get_balance;
+   PROCEDURE apply_monthly_interest IS
+   BEGIN
+      UPDATE loans SET balance = balance * (1 + rate);
+   END apply_monthly_interest;
+   PROCEDURE close_account(p_account_id IN NUMBER) IS
+   BEGIN
+      UPDATE accounts SET status = 'CLOSED' WHERE account_id = p_account_id;
+   END close_account;
+END core_banking;"""
+    # Only the routine whose BODY touches LOANS is named — not its siblings, and not the whole
+    # package. A spec section is just a signature, so it can never produce a false positive.
+    assert routines_referencing(source, "LOANS") == ["APPLY_MONTHLY_INTEREST"]
+    assert routines_referencing(source, "ACCOUNTS") == ["GET_BALANCE", "CLOSE_ACCOUNT"]
+    assert routines_referencing(source, "NO_SUCH") == []
+
+
+def test_parse_program_response_reads_per_routine_sentences():
+    raw = (
+        '{"summary": "Core banking.", "tables_used": ["ACCOUNTS"], "confidence": "high",'
+        ' "evidence": [],'
+        ' "routines": [{"name": "get_balance", "does": "Returns the balance."},'
+        '              {"name": "DEPOSIT", "summary": "Adds funds."}, {"bogus": true}]}'
+    )
+    sem = parse_program_response(_PROC, raw)
+    assert [(r.name, r.summary) for r in sem.routines] == [
+        ("GET_BALANCE", "Returns the balance."),
+        ("DEPOSIT", "Adds funds."),  # "summary" accepted as an alias for "does"
+    ]
+    assert sem.routine_summary("get_balance") == "Returns the balance."
+
+
+def test_program_contract_asks_for_package_routines():
+    prompt = build_program_prompt(_PROC)
+    assert '"routines"' in prompt and "ONE SENTENCE" in prompt

@@ -390,7 +390,9 @@ function treeSubprogram(pkg, routine) {
   const row = el("div", { class: "ws-col" },
     el("span", { class: "ws-cname", text: routine.name }),
     el("span", { class: "ws-ctype muted", text: (routine.kind || "").toLowerCase() }));
-  row.title = `${routine.kind} declared in ${pkg.name} — click to insert the call`;
+  row.title = routine.does
+    ? `${routine.does} (click to insert the call)`
+    : `${routine.kind} declared in ${pkg.name} — click to insert the call`;
   row.addEventListener("click", (e) => {
     e.stopPropagation();
     insertAtCursor($("#ws-sql"), `${pkg.name}.${routine.name}`);

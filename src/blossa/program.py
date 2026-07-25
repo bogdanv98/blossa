@@ -22,7 +22,13 @@ import re
 from collections.abc import Callable
 
 from .llm.base import LLMProvider, language_instruction
-from .models import ConfidenceLevel, ProgramKind, ProgramSemantics, ProgramUnit
+from .models import (
+    ConfidenceLevel,
+    ProgramKind,
+    ProgramSemantics,
+    ProgramUnit,
+    RoutineSemantics,
+)
 
 ProgressFn = Callable[[str, int, int], None]
 
@@ -64,6 +70,31 @@ def package_subprograms(source: str) -> list[str]:
     """Just the names from `declared_subprograms`, in declaration order."""
     return [name for name, _ in declared_subprograms(source)]
 
+
+def routines_referencing(source: str, identifier: str) -> list[str]:
+    """Which routines of a package mention `identifier` in their own section of the source.
+
+    "The package uses LOANS" is true but coarse; the useful answer is WHICH routine does. The
+    source is sectioned at each PROCEDURE/FUNCTION header (spec declarations and body
+    implementations both count as sections — a spec section is just a signature, so a real
+    reference can only surface in the body one) and each section is searched on a word boundary.
+    Deterministic and offline; declaration order is preserved.
+    """
+    if not source or not identifier:
+        return []
+    pattern = re.compile(rf"\b{re.escape(identifier)}\b", re.IGNORECASE)
+    headers = list(_SUBPROGRAM_RE.finditer(source))
+    order: list[str] = []
+    hit: set[str] = set()
+    for i, header in enumerate(headers):
+        name = header.group(2).upper()
+        if name not in order:
+            order.append(name)
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(source)
+        if pattern.search(source, header.end(), end):
+            hit.add(name)
+    return [n for n in order if n in hit]
+
 # Cap how much source we send per unit. Enough for the logic of normal app code; keeps the prompt
 # bounded for a pathological generated/wrapped unit. The model is told when it was truncated.
 _MAX_SOURCE_CHARS = 8000
@@ -90,8 +121,12 @@ _OUTPUT_CONTRACT = (
     '  "summary": "<what the unit does and the business logic, in plain language>",\n'
     '  "tables_used": ["<TABLE_OR_VIEW>", ...],\n'
     '  "confidence": "high|medium|low",\n'
-    '  "evidence": ["<short evidence string>", ...]\n'
-    "}"
+    '  "evidence": ["<short evidence string>", ...],\n'
+    '  "routines": [{"name": "<ROUTINE_NAME>", "does": "<one sentence>"}, ...]\n'
+    "}\n"
+    'For a PACKAGE, fill "routines" with ONE SENTENCE per procedure/function the package '
+    "declares (what that routine does for the business). For any other unit kind, return an "
+    "empty routines list."
 )
 
 
@@ -129,6 +164,12 @@ def parse_program_response(unit: ProgramUnit, raw: str) -> ProgramSemantics:
     data = _loads_lenient(raw)
     if not isinstance(data, dict):
         return _fallback(unit, "The model returned no parseable JSON.")
+    routines = [
+        RoutineSemantics(name=str(r.get("name", "")).strip().upper(),
+                         summary=str(r.get("does") or r.get("summary") or "").strip())
+        for r in (data.get("routines") or [])
+        if isinstance(r, dict) and str(r.get("name", "")).strip()
+    ]
     return ProgramSemantics(
         name=unit.name,
         owner=unit.owner,
@@ -137,6 +178,7 @@ def parse_program_response(unit: ProgramUnit, raw: str) -> ProgramSemantics:
         tables_used=_as_str_list(data.get("tables_used")),
         confidence=_coerce_confidence(data.get("confidence")),
         evidence=_as_str_list(data.get("evidence")),
+        routines=routines,
     )
 
 

@@ -172,9 +172,13 @@ def build_map_view(report: ScanReport) -> dict:
             # VALID/INVALID from the catalog — an invalid package is worth seeing in the tree.
             "status": obj_status.get(((u.owner or "").upper(), u.name.upper(), u.kind.value), ""),
             # What a package declares: these routines exist only inside it, never in the catalog,
-            # so the tree is the only place a user can discover them.
+            # so the tree is the only place a user can discover them. "does" joins in the
+            # per-routine sentence captured by the package's own explain call, when one ran.
             "subprograms": (
-                [{"name": n, "kind": k.value} for n, k in declared_subprograms(u.source)]
+                [
+                    {"name": n, "kind": k.value, "does": ps.routine_summary(n) if ps else ""}
+                    for n, k in declared_subprograms(u.source)
+                ]
                 if u.kind == ProgramKind.PACKAGE
                 else []
             ),

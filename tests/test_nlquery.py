@@ -555,3 +555,31 @@ def test_privilege_hint_fires_on_denied_dba_query():
 def test_privilege_hint_silent_for_all_views_and_other_errors():
     assert privilege_hint("SELECT * FROM ALL_TABLES", _DENIED) is None
     assert privilege_hint("SELECT * FROM DBA_USERS", "ORA-12170: connection timeout") is None
+
+
+def test_usage_answer_names_the_routines_and_what_they_do():
+    # "LOANS is used by CORE_BANKING (package)" is true but coarse: the useful answer names the
+    # routine inside the package and, when the scan captured it, says what that routine does.
+    from blossa.models import ProgramKind, ProgramSemantics, ProgramUnit, RoutineSemantics
+
+    report = _demo_report()
+    report.schema_info.program_units.append(ProgramUnit(
+        name="CORE_BANKING", owner="BANKDEMO", kind=ProgramKind.PACKAGE,
+        source="""PACKAGE core_banking AS
+   PROCEDURE apply_monthly_interest;
+END core_banking;PACKAGE BODY core_banking AS
+   PROCEDURE apply_monthly_interest IS BEGIN UPDATE loans SET x = 1; END;
+END core_banking;"""))
+    report.program_semantics.append(ProgramSemantics(
+        name="CORE_BANKING", owner="BANKDEMO", kind=ProgramKind.PACKAGE,
+        summary="Core banking operations.", confidence=ConfidenceLevel.HIGH,
+        routines=[RoutineSemantics(name="APPLY_MONTHLY_INTEREST",
+                                   summary="Applies the monthly interest to every loan.")]))
+    report.schema_info.tables.append(
+        __import__("blossa.models", fromlist=["TableInfo"]).TableInfo(name="LOANS",
+                                                                      owner="BANKDEMO"))
+    res = answer_program_lookup("where in the code is LOANS used?", report)
+    assert res is not None
+    assert "CORE_BANKING" in res.explanation
+    assert "APPLY_MONTHLY_INTEREST" in res.explanation  # the routine, not just the package
+    assert "Applies the monthly interest" in res.explanation  # and what it does

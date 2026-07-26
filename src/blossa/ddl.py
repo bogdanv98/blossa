@@ -37,6 +37,14 @@ METADATA_TYPES = {
     "MATERIALIZED VIEW": "MATERIALIZED_VIEW",
     "TYPE": "TYPE",
     "INDEX": "INDEX",
+    # Every DBMS_SCHEDULER object is fetched under the single type PROCOBJ, not under its own
+    # catalog name. GET_DDL then returns the anonymous block that recreates it — for a chain,
+    # the create_chain + define_chain_step + define_chain_rule script in full.
+    "JOB": "PROCOBJ",
+    "PROGRAM": "PROCOBJ",
+    "CHAIN": "PROCOBJ",
+    "SCHEDULE": "PROCOBJ",
+    "JOB CLASS": "PROCOBJ",
 }
 
 # GET_DDL returns a CLOB; the caller's row reader turns it into text. Everything is bound, so no
@@ -90,6 +98,28 @@ def offline_ddl(report: ScanReport, owner: str | None, name: str, object_type: s
     if kind == "TABLE":
         table = _find_table(report, owner, name)
         return synthesize_table_ddl(table) if table else ""
+    if kind == "CHAIN":
+        chain = next(
+            (
+                c
+                for c in report.schema_info.scheduler_chains
+                if c.name.upper() == name.upper()
+                and (not owner or (c.owner or "").upper() == owner)
+            ),
+            None,
+        )
+        return synthesize_chain_ddl(chain) if chain else ""
+    if kind == "JOB":
+        job = next(
+            (
+                j
+                for j in report.schema_info.scheduler_jobs
+                if j.name.upper() == name.upper()
+                and (not owner or (j.owner or "").upper() == owner)
+            ),
+            None,
+        )
+        return synthesize_job_ddl(job) if job else ""
     unit = next(
         (
             u
@@ -99,6 +129,79 @@ def offline_ddl(report: ScanReport, owner: str | None, name: str, object_type: s
         None,
     )
     return (unit.source or "").strip() if unit else ""
+
+
+def synthesize_chain_ddl(chain) -> str:
+    """Rebuild a job chain as the DBMS_SCHEDULER calls that would recreate it.
+
+    The offline counterpart to GET_DDL for a chain. Rules come last and in name order, which is
+    how they read as a graph: the START rule first, the END rules last.
+    """
+    qualified = f"{chain.owner}.{chain.name}" if chain.owner else chain.name
+    lines = [
+        "-- Reconstructed by Blossa from the scanned map (Oracle's own DDL was unavailable).",
+        "BEGIN",
+        f"  DBMS_SCHEDULER.CREATE_CHAIN(chain_name => {_quote(qualified)}"
+        + (f",\n{' ' * 22}comments   => {_quote(chain.comment)}" if chain.comment else "")
+        + ");",
+        "",
+    ]
+    for step in chain.steps:
+        program = step.program_name or ""
+        if step.program_owner and program:
+            program = f"{step.program_owner}.{program}"
+        lines.append(
+            f"  DBMS_SCHEDULER.DEFINE_CHAIN_STEP({_quote(qualified)}, "
+            f"{_quote(step.name)}, {_quote(program)});"
+            + (f"   -- calls {step.action}" if step.action else "")
+        )
+    if chain.steps:
+        lines.append("")
+    for rule in chain.rules:
+        lines.append(
+            f"  DBMS_SCHEDULER.DEFINE_CHAIN_RULE({_quote(qualified)},\n"
+            f"    condition => {_quote(rule.condition)},\n"
+            f"    action    => {_quote(rule.action)},\n"
+            f"    rule_name => {_quote(rule.name)});"
+        )
+    if chain.enabled:
+        lines.append("")
+        lines.append(f"  DBMS_SCHEDULER.ENABLE({_quote(qualified)});")
+    lines.append("END;")
+    lines.append("/")
+    return "\n".join(lines)
+
+
+def synthesize_job_ddl(job) -> str:
+    """Rebuild a scheduled job as the DBMS_SCHEDULER call that would recreate it."""
+    qualified = f"{job.owner}.{job.name}" if job.owner else job.name
+    args = [f"job_name        => {_quote(qualified)}"]
+    if job.job_type:
+        args.append(f"job_type        => {_quote(job.job_type)}")
+    if job.job_action:
+        args.append(f"job_action      => {_quote(job.job_action)}")
+    if job.program_name:
+        args.append(f"program_name    => {_quote(job.program_name)}")
+    if job.repeat_interval:
+        args.append(f"repeat_interval => {_quote(job.repeat_interval)}")
+    args.append(f"enabled         => {'TRUE' if job.enabled else 'FALSE'}")
+    if job.comment:
+        args.append(f"comments        => {_quote(job.comment)}")
+
+    lines = [
+        "-- Reconstructed by Blossa from the scanned map (Oracle's own DDL was unavailable).",
+        "BEGIN",
+        "  DBMS_SCHEDULER.CREATE_JOB(",
+        ",\n".join(f"    {a}" for a in args),
+        "  );",
+    ]
+    if job.restartable:
+        lines.append(
+            f"  DBMS_SCHEDULER.SET_ATTRIBUTE({_quote(qualified)}, 'restartable', TRUE);"
+        )
+    lines.append("END;")
+    lines.append("/")
+    return "\n".join(lines)
 
 
 def _find_table(report: ScanReport, owner: str | None, name: str) -> TableInfo | None:

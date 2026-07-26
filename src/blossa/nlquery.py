@@ -147,6 +147,56 @@ _APP_OWNER_FILTER = (
 # Catalog/metadata views, by scope. "scoped" uses ALL_* — Oracle limits these to objects this
 # account may read, so answers are naturally confined to the granted schemas. "full" uses DBA_*
 # (the whole database; needs SELECT_CATALOG_ROLE).
+def _scheduler_reference(p: str, owner_subquery: str) -> str:
+    """The DBMS_SCHEDULER views with their REAL columns, prefixed ALL_ or DBA_.
+
+    Naming these views without their shape is exactly what made the model invent a
+    `*_SCHEDULER_STEPS` view joined on a `CHAIN_ID` — neither exists. Every column below was read
+    off the 21c dictionary, and the traps that caused that failure are called out inline.
+
+    `owner_subquery` is the scope's own "which owners are applications" subquery. It is spelled
+    out in a worked example because the second failure mode here was the model applying the
+    ORACLE_MAINTAINED predicate straight to a scheduler view, which has no such column.
+    """
+    return (
+        f"- {p}_SCHEDULER_JOBS(OWNER, JOB_NAME, JOB_SUBNAME, JOB_TYPE, JOB_ACTION, PROGRAM_NAME, "
+        "SCHEDULE_TYPE, REPEAT_INTERVAL, ENABLED, STATE, RESTARTABLE, LAST_START_DATE, "
+        "NEXT_RUN_DATE, RUN_COUNT, FAILURE_COUNT, COMMENTS): scheduled jobs. JOB_TYPE='CHAIN' "
+        "means JOB_ACTION names the chain the job runs. ENABLED/RESTARTABLE are the STRINGS "
+        "'TRUE'/'FALSE', not booleans. Rows with JOB_SUBNAME set are transient per-step runs the "
+        "scheduler spawns, so add JOB_SUBNAME IS NULL to list the jobs a schema actually "
+        "declares.\n"
+        f"- {p}_SCHEDULER_CHAINS(OWNER, CHAIN_NAME, RULE_SET_OWNER, RULE_SET_NAME, "
+        "NUMBER_OF_RULES, NUMBER_OF_STEPS, ENABLED, EVALUATION_INTERVAL, USER_RULE_SET, "
+        "COMMENTS): job chains — a batch whose steps have an order. There is NO CHAIN_ID and NO "
+        "SCHEMA_OWNER column: join chains to their steps and rules on OWNER + CHAIN_NAME.\n"
+        f"- {p}_SCHEDULER_CHAIN_STEPS(OWNER, CHAIN_NAME, STEP_NAME, PROGRAM_OWNER, PROGRAM_NAME, "
+        "STEP_TYPE, SKIP, PAUSE, PAUSE_BEFORE, TIMEOUT): the steps of a chain. The view is "
+        f"_CHAIN_STEPS — there is no {p}_SCHEDULER_STEPS.\n"
+        f"- {p}_SCHEDULER_CHAIN_RULES(OWNER, CHAIN_NAME, RULE_OWNER, RULE_NAME, CONDITION, "
+        "ACTION, COMMENTS): the chain's edges, and the ONLY place its order is recorded — the "
+        "steps do not carry it. CONDITION looks like 'S1 SUCCEEDED AND S2 SUCCEEDED', ACTION "
+        "like 'START \"S3\"', 'START \"S3\",\"S4\"' (a parallel fan-out) or 'END 0'.\n"
+        f"- {p}_SCHEDULER_PROGRAMS(OWNER, PROGRAM_NAME, PROGRAM_TYPE, PROGRAM_ACTION, "
+        "NUMBER_OF_ARGUMENTS, ENABLED, COMMENTS): PROGRAM_ACTION is the procedure or block a "
+        "chain step actually calls.\n"
+        f"- {p}_SCHEDULER_JOB_RUN_DETAILS(OWNER, JOB_NAME, JOB_SUBNAME, LOG_ID, LOG_DATE, STATUS, "
+        "ERROR#, ACTUAL_START_DATE, RUN_DURATION, ADDITIONAL_INFO): one row per execution. For a "
+        "chain job the per-step rows carry STEP_NAME inside ADDITIONAL_INFO.\n"
+        "  NONE of the scheduler views has an ORACLE_MAINTAINED column — that lives only on the "
+        "users view — so restrict owners with a SUBQUERY, never with a predicate on the scheduler "
+        "view itself. Worked example, every application chain with its steps:\n"
+        f"    SELECT c.OWNER, c.CHAIN_NAME, s.STEP_NAME, s.PROGRAM_NAME\n"
+        f"      FROM {p}_SCHEDULER_CHAINS c\n"
+        f"      JOIN {p}_SCHEDULER_CHAIN_STEPS s\n"
+        f"        ON s.OWNER = c.OWNER AND s.CHAIN_NAME = c.CHAIN_NAME\n"
+        f"     WHERE c.OWNER IN {owner_subquery}\n"
+        f"     ORDER BY c.OWNER, c.CHAIN_NAME, s.STEP_NAME\n"
+        "  To show a chain's ORDER instead of just its steps, select CONDITION and ACTION from "
+        f"{p}_SCHEDULER_CHAIN_RULES joined the same way.\n"
+    )
+
+
 CATALOG_REFERENCE_SCOPED = (
     "- ALL_TABLES(OWNER, TABLE_NAME, NUM_ROWS): tables this account can read. NUM_ROWS is an "
     "approximate optimizer statistic (may be stale/NULL) — for an exact count of one table use "
@@ -168,7 +218,10 @@ CATALOG_REFERENCE_SCOPED = (
     "(ORACLE_MAINTAINED='N') from Oracle-internal ones; never list schemas from it directly — it "
     "shows every user, not just what this account can read.\n"
     "- ALL_TAB_COMMENTS / ALL_COL_COMMENTS: documentation comments.\n"
-    "These ALL_* views show only objects this account may read, so answers are limited to the "
+    + _scheduler_reference(
+        "ALL", "(SELECT USERNAME FROM ALL_USERS WHERE ORACLE_MAINTAINED='N')"
+    )
+    + "These ALL_* views show only objects this account may read, so answers are limited to the "
     "granted schemas — but public grants can still leak a few Oracle-internal objects, so ALWAYS "
     "restrict to application owners: keep only owners with ALL_USERS.ORACLE_MAINTAINED='N' (this "
     "drops SYS/SYSTEM/XDB and the like).\n"
@@ -189,10 +242,12 @@ CATALOG_REFERENCE_SCOPED = (
     "ALL_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
     "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
     "application owners the same way, e.g. ALL_INDEXES, ALL_TRIGGERS, ALL_SEQUENCES, "
-    "ALL_SYNONYMS, ALL_PROCEDURES, ALL_SCHEDULER_JOBS, ALL_SCHEDULER_CHAINS (a 'chain' is a "
-    "DBMS_SCHEDULER job chain). If you do not recognise the object kind being asked about, set "
-    "\"sql\" to \"\" and ask the user to clarify rather than guessing."
+    "ALL_SYNONYMS, ALL_PROCEDURES. For anything scheduled, use the ALL_SCHEDULER_* views "
+    "documented above and their exact columns — do not invent a view name or a join key. If you "
+    "do not recognise the object kind being asked about, set \"sql\" to \"\" and ask the user to "
+    "clarify rather than guessing."
 )
+
 CATALOG_REFERENCE_FULL = (
     "- DBA_USERS(USERNAME, ORACLE_MAINTAINED, ACCOUNT_STATUS, CREATED): every user/schema. "
     "Application schemas have ORACLE_MAINTAINED = 'N' — exclude the others when counting apps.\n"
@@ -212,7 +267,8 @@ CATALOG_REFERENCE_FULL = (
     "the ONLY view "
     "that finds a packaged routine by name: WHERE PROCEDURE_NAME = 'GET_BALANCE'.\n"
     "- DBA_TAB_COMMENTS / DBA_COL_COMMENTS: documentation comments.\n"
-    "Distinguish the two countings carefully — copy these exact patterns:\n"
+    + _scheduler_reference("DBA", f"(SELECT USERNAME FROM DBA_USERS {_APP_OWNER_FILTER})")
+    + "Distinguish the two countings carefully — copy these exact patterns:\n"
     "Application accounts are ORACLE_MAINTAINED='N', but a few Oracle operational accounts also "
     "carry that flag — exclude them everywhere with this filter:\n"
     f"    {_APP_OWNER_FILTER}\n"
@@ -231,9 +287,10 @@ CATALOG_REFERENCE_FULL = (
     "DBA_OBJECTS with OBJECT_TYPE = that kind (e.g. 'INDEX', 'SEQUENCE', 'PROCEDURE', 'TRIGGER').\n"
     "  * Other Oracle object kinds have their own dictionary view — use it, filtered to "
     "application owners the same way, e.g. DBA_INDEXES, DBA_TRIGGERS, DBA_SEQUENCES, "
-    "DBA_SYNONYMS, DBA_PROCEDURES, DBA_SCHEDULER_JOBS, DBA_SCHEDULER_CHAINS (a 'chain' is a "
-    "DBMS_SCHEDULER job chain). If you do not recognise the object kind being asked about, set "
-    "\"sql\" to \"\" and ask the user to clarify rather than guessing."
+    "DBA_SYNONYMS, DBA_PROCEDURES. For anything scheduled, use the DBA_SCHEDULER_* views "
+    "documented above and their exact columns — do not invent a view name or a join key. If you "
+    "do not recognise the object kind being asked about, set \"sql\" to \"\" and ask the user to "
+    "clarify rather than guessing."
 )
 
 
@@ -894,21 +951,104 @@ def enforce_error_severity_filter(
     return result
 
 
-def privilege_hint(sql: str, error: str) -> str | None:
-    """If a catalog query failed for lack of privilege, suggest the fix; else None.
+# A dictionary view referenced in a generated query, e.g. DBA_SCHEDULER_CHAINS.
+_DICT_VIEW = re.compile(r"\b((?:DBA|ALL|USER)_[A-Z0-9_$#]+)\b", re.IGNORECASE)
 
-    A query over the whole-database DBA_* views needs SELECT_CATALOG_ROLE; without it Oracle
-    reports ORA-00942 / insufficient privileges. Surface that as actionable guidance.
+# The scheduler family is where a model most often invents a plausible-looking view, because the
+# real names are irregular (_CHAIN_STEPS, not _STEPS). Knowing the true set lets us say "no such
+# view" with certainty instead of guessing at privileges.
+_SCHEDULER_VIEWS = frozenset(
+    f"{prefix}_SCHEDULER_{suffix}"
+    for prefix in ("DBA", "ALL", "USER")
+    for suffix in (
+        "JOBS", "CHAINS", "CHAIN_STEPS", "CHAIN_RULES", "PROGRAMS", "PROGRAM_ARGS",
+        "JOB_ARGS", "JOB_CLASSES", "JOB_LOG", "JOB_RUN_DETAILS", "RUNNING_JOBS",
+        "SCHEDULES", "WINDOWS", "GLOBAL_ATTRIBUTE", "CREDENTIALS", "FILE_WATCHERS",
+        "DESTINATIONS", "NOTIFICATIONS", "GROUPS", "JOB_DESTS", "CHAIN_RULES_TRANSLATED",
+    )
+)
+
+
+def unknown_dictionary_views(sql: str) -> list[str]:
+    """Dictionary views in `sql` that provably do not exist in Oracle.
+
+    Only the scheduler family is checked, because it is the only one whose full membership we
+    know. Everything else is left alone rather than risk calling a real view imaginary.
+    """
+    seen: list[str] = []
+    for name in _DICT_VIEW.findall(sql):
+        upper = name.upper()
+        if "_SCHEDULER_" not in upper or upper in _SCHEDULER_VIEWS or upper in seen:
+            continue
+        seen.append(upper)
+    return seen
+
+
+def privilege_hint(sql: str, error: str, catalog_readable: bool | None = None) -> str | None:
+    """Explain a failed catalog query, or None when the failure is something else.
+
+    ORA-00942 says "table or view does not exist", and Oracle returns it for TWO different
+    problems: the view really is missing (a wrong name), or it exists but this account cannot see
+    it (a missing privilege). Those have opposite fixes, so guessing sends the reader the wrong
+    way — this used to always blame privileges, which is wrong whenever the model simply invented
+    a view name.
+
+    `catalog_readable` is the caller's probe of whether the account can read DBA_* at all. When it
+    is True the privilege explanation is ruled out; when it is None we do not know, and say so.
     """
     e = error.lower()
     denied = "ora-00942" in e or "insufficient priv" in e or "table or view does not exist" in e
-    if "dba_" in sql.lower() and denied:
+    if not denied:
+        return None
+
+    bogus = unknown_dictionary_views(sql)
+    if bogus:
+        return (
+            f"No such view: {', '.join(bogus)}. The scheduler views are ALL_/DBA_SCHEDULER_JOBS, "
+            "_CHAINS, _CHAIN_STEPS, _CHAIN_RULES, _PROGRAMS and _JOB_RUN_DETAILS — chains join to "
+            "their steps and rules on OWNER + CHAIN_NAME, and there is no chain id. Rephrase the "
+            "question and Blossa will retry with the documented shape."
+        )
+
+    if "dba_" not in sql.lower():
+        return None
+
+    if catalog_readable:
+        return (
+            "This account can read the DBA_* views, so it is not a privilege problem: one of the "
+            "names in the query does not exist. Check the view and column names against the "
+            "catalog list Blossa provided."
+        )
+    if catalog_readable is False:
         return (
             "That catalog question used the whole-database DBA_* views, which need a privileged "
             "account (SELECT_CATALOG_ROLE). Use the 'full' access profile, or set "
             "oracle.catalog_scope: scoped to answer from the ALL_* views instead."
         )
-    return None
+    return (
+        "That catalog question used the whole-database DBA_* views. Either the account lacks "
+        "SELECT_CATALOG_ROLE (use the 'full' access profile, or set oracle.catalog_scope: scoped "
+        "to answer from the ALL_* views), or one of the view names does not exist."
+    )
+
+
+_CATALOG_PROBE_SQL = "SELECT 1 FROM DBA_OBJECTS WHERE ROWNUM = 1"
+
+
+def catalog_is_readable(db: object) -> bool | None:
+    """Whether this account can read the DBA_* catalog at all — the discriminator for ORA-00942.
+
+    Returns None if the probe itself could not be attempted, so the caller can say "unknown"
+    rather than assert either cause.
+    """
+    query = getattr(db, "query", None)
+    if query is None:
+        return None
+    try:
+        query(_CATALOG_PROBE_SQL)
+    except Exception:  # noqa: BLE001 - a refusal IS the answer: no catalog access
+        return False
+    return True
 
 
 # ------------------------------------------------------------------- helpers

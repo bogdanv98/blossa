@@ -18,6 +18,7 @@ from blossa.nlquery import (
     expand_count_to_list,
     parse_ask_response,
     privilege_hint,
+    unknown_dictionary_views,
     validate_read_only_select,
     with_row_limit,
 )
@@ -555,6 +556,58 @@ def test_privilege_hint_fires_on_denied_dba_query():
 def test_privilege_hint_silent_for_all_views_and_other_errors():
     assert privilege_hint("SELECT * FROM ALL_TABLES", _DENIED) is None
     assert privilege_hint("SELECT * FROM DBA_USERS", "ORA-12170: connection timeout") is None
+
+
+def test_privilege_hint_does_not_blame_privileges_when_the_catalog_is_readable():
+    """ORA-00942 also means 'no such view'. An account that demonstrably reads DBA_* did not
+    hit a privilege wall, and telling it to get SELECT_CATALOG_ROLE sends the reader nowhere."""
+    hint = privilege_hint("SELECT * FROM DBA_USERS", _DENIED, catalog_readable=True)
+    assert hint and "SELECT_CATALOG_ROLE" not in hint
+    assert "does not exist" in hint
+
+
+def test_privilege_hint_still_blames_privileges_when_the_catalog_is_closed():
+    hint = privilege_hint("SELECT * FROM DBA_USERS", _DENIED, catalog_readable=False)
+    assert hint and "SELECT_CATALOG_ROLE" in hint
+
+
+def test_privilege_hint_covers_both_causes_when_access_is_unknown():
+    hint = privilege_hint("SELECT * FROM DBA_USERS", _DENIED)
+    assert hint and "SELECT_CATALOG_ROLE" in hint and "does not exist" in hint
+
+
+def test_invented_scheduler_view_is_named_outright():
+    """The real failure this fixes: the model joined DBA_SCHEDULER_STEPS, which does not exist."""
+    sql = (
+        "SELECT C.CHAIN_NAME, S.STEP_NAME FROM DBA_SCHEDULER_CHAINS C "
+        "JOIN DBA_SCHEDULER_STEPS S ON C.CHAIN_ID = S.CHAIN_ID"
+    )
+    hint = privilege_hint(sql, _DENIED, catalog_readable=True)
+    assert hint and "DBA_SCHEDULER_STEPS" in hint
+    assert "_CHAIN_STEPS" in hint
+    # It must not be reported as a privilege problem, whatever the probe said.
+    assert "SELECT_CATALOG_ROLE" not in hint
+    assert "SELECT_CATALOG_ROLE" not in privilege_hint(sql, _DENIED, catalog_readable=False)
+
+
+def test_real_scheduler_views_are_not_called_imaginary():
+    for view in (
+        "ALL_SCHEDULER_CHAIN_STEPS", "DBA_SCHEDULER_CHAIN_RULES",
+        "ALL_SCHEDULER_JOBS", "DBA_SCHEDULER_JOB_RUN_DETAILS", "USER_SCHEDULER_PROGRAMS",
+    ):
+        assert unknown_dictionary_views(f"SELECT * FROM {view}") == []
+    # Non-scheduler views are never judged: we do not know that family's full membership.
+    assert unknown_dictionary_views("SELECT * FROM DBA_WIDGETS") == []
+
+
+def test_scheduler_views_are_documented_with_their_real_columns():
+    """Naming a view without its shape is what let the model invent CHAIN_ID in the first place."""
+    for scope in (True, False):
+        ref = catalog_reference(scope)
+        prefix = "DBA" if scope else "ALL"
+        assert f"{prefix}_SCHEDULER_CHAIN_STEPS(OWNER, CHAIN_NAME, STEP_NAME" in ref
+        assert f"{prefix}_SCHEDULER_CHAIN_RULES(OWNER, CHAIN_NAME, RULE_OWNER" in ref
+        assert "no CHAIN_ID" in ref.replace("NO CHAIN_ID", "no CHAIN_ID")
 
 
 def test_usage_answer_names_the_routines_and_what_they_do():

@@ -54,6 +54,7 @@ from .nlquery import (
     UnsafeQueryError,
     answer_program_lookup,
     build_ask_prompt,
+    catalog_is_readable,
     enforce_error_severity_filter,
     expand_count_to_list,
     parse_ask_response,
@@ -372,7 +373,15 @@ def _answer_ask_turn(
             rows = db.query(with_row_limit(safe_sql, max_rows))
     except Exception as exc:  # noqa: BLE001
         err.print(f"[bold red]Query failed:[/bold red] {exc}")
-        hint = privilege_hint(safe_sql, str(exc))
+        # Probe on a fresh connection (the failed one is gone) so the hint can tell a missing
+        # privilege from a view name that does not exist. Only on the error path.
+        readable: bool | None = None
+        try:
+            with Database(settings.oracle) as probe:
+                readable = catalog_is_readable(probe)
+        except Exception:  # noqa: BLE001 - cannot probe: the hint says "unknown" instead
+            readable = None
+        hint = privilege_hint(safe_sql, str(exc), readable)
         if hint:
             err.print(f"  [dim]{hint}[/dim]")
         if strict:

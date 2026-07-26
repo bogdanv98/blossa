@@ -92,6 +92,44 @@ _No findings._
 {% endfor %}
 
 {% endif %}
+{% if schema.scheduler_jobs or schema.scheduler_chains %}
+## Scheduled processes
+
+> What this schema runs on a timer, read from the scheduler catalog. A chain is a batch whose
+> steps have an order: the rules are the edges — a fan-out starts several steps at once, an AND
+> condition is a join that waits for all of them, and `END n` is where the run finishes.
+
+{% if schema.scheduler_jobs %}
+| Job | Runs | Cadence | State | Restartable |
+| --- | --- | --- | --- | --- |
+{% for j in schema.scheduler_jobs %}
+| `{{ (j.owner ~ "." if multi_schema and j.owner else "") }}{{ j.name }}` | {{ j.job_type }}{{ " · `" ~ j.job_action ~ "`" if j.job_action else "" }} | {{ j.repeat_interval | replace("|", "\\|") or "—" }} | {{ j.state or "—" }}{{ "" if j.enabled else " (disabled)" }} | {{ "yes" if j.restartable else "no" }} |
+{% endfor %}
+
+{% endif %}
+{% for chain in schema.scheduler_chains %}
+### Chain `{{ (chain.owner ~ "." if multi_schema and chain.owner else "") }}{{ chain.name }}`{{ "" if chain.enabled else " (disabled)" }}
+
+{% if chain.comment %}
+{{ chain.comment }}
+
+{% endif %}
+{{ chain.steps | length }} step(s), {{ chain.rules | length }} rule(s).
+
+| Step | Runs |
+| --- | --- |
+{% for s in chain.steps %}
+| `{{ s.name }}` | {{ "`" ~ s.action ~ "`" if s.action else ("`" ~ (s.program_owner ~ "." if s.program_owner else "") ~ (s.program_name or "—") ~ "`") }} |
+{% endfor %}
+
+| Rule | When | Then |
+| --- | --- | --- |
+{% for r in chain.rules %}
+| `{{ r.name }}` | {{ r.condition | replace("|", "\\|") | replace("\n", " ") }} | {{ r.action | replace("|", "\\|") | replace("\n", " ") }} |
+{% endfor %}
+
+{% endfor %}
+{% endif %}
 {% if report.log_tables %}
 ## Application logs
 

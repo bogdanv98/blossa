@@ -17,16 +17,18 @@ the endpoints can be tested without a live model or database.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .. import __version__
 from ..codegen import (
     CODEGEN_SYSTEM_PROMPT,
     build_codegen_prompt,
@@ -65,6 +67,7 @@ from ..nlquery import (
     UnsafeQueryError,
     answer_program_lookup,
     build_ask_prompt,
+    catalog_is_readable,
     enforce_error_severity_filter,
     expand_count_to_list,
     parse_ask_response,
@@ -75,6 +78,37 @@ from ..nlquery import (
 from ..program import declared_subprograms
 
 _STATIC_DIR = Path(__file__).parent / "static"
+
+
+def _asset_version() -> str:
+    """A token that changes whenever a static asset changes.
+
+    The assets carry no expiry of their own, so a browser is free to reuse app.js out of its
+    heuristic cache and pair an old UI with a newer server — which is exactly how a shipped tab
+    can fail to appear. Stamping this into the asset URLs makes that impossible, and keying it on
+    file mtime+size (not the release version) means it also turns over during development.
+    """
+    parts = [__version__]
+    for name in ("app.js", "style.css"):
+        try:
+            st = (_STATIC_DIR / name).stat()
+            parts.append(f"{name}:{int(st.st_mtime)}:{st.st_size}")
+        except OSError:  # asset missing: fall back to the version alone
+            parts.append(name)
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+
+class _RevalidatingStatic(StaticFiles):
+    """Serve assets with `Cache-Control: no-cache` — revalidate, don't blindly reuse.
+
+    The ETag is still honoured, so an unchanged file costs one 304 rather than a re-download.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 
 # Object types the map already describes in detail (tables + program units), so the browser's
 # catch-all "other objects" list doesn't duplicate them.
@@ -207,6 +241,67 @@ def build_map_view(report: ScanReport) -> dict:
         for lt in report.log_tables
     ]
 
+    # Scheduled processes. A step names a program, the program names a procedure — resolved during
+    # introspection — so the UI can show the batch's order and let a reader jump from a step to the
+    # packaged routine the Logic tab already explains.
+    # Keyed on the unqualified unit name: a step's action names the package, and the same package
+    # name cannot repeat within one owner. Falls back across owners for single-schema maps.
+    sem_by_unit = {ps.name.upper(): ps for ps in report.program_semantics}
+
+    def step_view(step) -> dict:
+        # "BANKDEMO.EOD_BATCH.S04_SETTLE_PENDING" -> package EOD_BATCH, routine S04_SETTLE_PENDING.
+        parts = [p.strip('"') for p in step.action.split(".")] if step.action else []
+        package = parts[-2].upper() if len(parts) >= 2 else ""
+        routine = parts[-1].upper() if parts else ""
+        ps = sem_by_unit.get(package) if package else None
+        summary = ps.routine_summary(routine) if ps else ""
+        return {
+            "name": step.name,
+            "program": q(step.program_name, step.program_owner) if step.program_name else "",
+            "action": step.action,
+            "package": package,
+            "routine": routine,
+            "does": summary,
+        }
+
+    scheduler_chains = [
+        {
+            "name": q(chain.name, chain.owner),
+            "owner": chain.owner,
+            "enabled": chain.enabled,
+            "comment": chain.comment or "",
+            "steps": [step_view(s) for s in chain.steps],
+            "rules": [
+                {
+                    "name": r.name,
+                    "condition": r.condition,
+                    "action": r.action,
+                    "comment": r.comment or "",
+                }
+                for r in chain.rules
+            ],
+        }
+        for chain in report.schema_info.scheduler_chains
+    ]
+
+    scheduler_jobs = [
+        {
+            "name": q(job.name, job.owner),
+            "owner": job.owner,
+            "job_type": job.job_type,
+            "job_action": job.job_action,
+            "runs_chain": job.runs_chain,
+            "repeat_interval": job.repeat_interval,
+            "enabled": job.enabled,
+            "state": job.state,
+            "restartable": job.restartable,
+            "last_start": job.last_start,
+            "next_run": job.next_run,
+            "comment": job.comment or "",
+        }
+        for job in report.schema_info.scheduler_jobs
+    ]
+
     return {
         "schema_name": report.metadata.schema_name,
         "multi_schema": multi,
@@ -216,6 +311,8 @@ def build_map_view(report: ScanReport) -> dict:
         "programs": programs,
         "other_objects": other_objects,
         "log_tables": log_tables,
+        "scheduler_chains": scheduler_chains,
+        "scheduler_jobs": scheduler_jobs,
     }
 
 
@@ -334,7 +431,15 @@ def create_app(
                 rows = db.query(with_row_limit(safe_sql, body.max_rows))
         except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
             detail = f"Query failed: {exc}"
-            hint = privilege_hint(safe_sql, str(exc))
+            # Probe on a fresh connection so the hint can tell a missing privilege from a view
+            # name that does not exist. Only on the error path.
+            readable: bool | None = None
+            try:
+                with make_db() as probe:
+                    readable = catalog_is_readable(probe)
+            except Exception:  # noqa: BLE001 - cannot probe: the hint says "unknown" instead
+                readable = None
+            hint = privilege_hint(safe_sql, str(exc), readable)
             if hint:
                 detail += f"  {hint}"
             raise HTTPException(status_code=502, detail=detail) from exc
@@ -442,8 +547,13 @@ def create_app(
         return report_obj.model_dump()
 
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(_STATIC_DIR / "index.html")
+    def index() -> HTMLResponse:
+        """The app shell, with its asset URLs stamped so a stale bundle can never be reused."""
+        html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(
+            html.replace("__ASSET_VERSION__", _asset_version()),
+            headers={"Cache-Control": "no-cache"},
+        )
 
-    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+    app.mount("/static", _RevalidatingStatic(directory=_STATIC_DIR), name="static")
     return app

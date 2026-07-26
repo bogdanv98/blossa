@@ -36,6 +36,7 @@ async function loadMap() {
   renderTree();
   renderTableList(MAP.tables);
   renderPrograms(MAP.programs || []);
+  renderProcesses(MAP.scheduler_jobs || [], MAP.scheduler_chains || []);
   renderLogs(MAP.log_tables || []);
 }
 
@@ -317,6 +318,12 @@ function renderTree(filter = "") {
     { label: "Synonyms", items: ofType("SYNONYM"), render: treeCatalogObject },
     { label: "Types", items: ofType("TYPE"), render: treeCatalogObject },
     { label: "Indexes", items: ofType("INDEX"), render: treeCatalogObject },
+    // Scheduler objects. The Processes tab explains what they do; here they are just part of the
+    // inventory, so a browsing user can see the schema schedules something at all.
+    { label: "Jobs", items: ofType("JOB"), render: treeCatalogObject },
+    { label: "Chains", items: ofType("CHAIN"), render: treeCatalogObject },
+    { label: "Scheduler programs", items: ofType("PROGRAM"), render: treeCatalogObject },
+    { label: "Schedules", items: ofType("SCHEDULE"), render: treeCatalogObject },
   ];
   // Browsing shows EVERY category, empty ones included: "Views 0" tells you this schema has none,
   // where a missing folder only makes you wonder whether the tool can show them at all. While
@@ -698,6 +705,111 @@ $("#logic-search").addEventListener("input", (e) => {
     (p.summary || "").toLowerCase().includes(q) ||
     (p.tables_used || []).join(" ").toLowerCase().includes(q)
   ));
+});
+
+// --- scheduled processes ----------------------------------------------------
+// A chain's order lives in its rules, not its steps, so the rules are rendered as the readable
+// part: "when this holds, start that". Steps are shown with the procedure they actually call, so
+// a reader can carry the name straight over to the Logic tab.
+
+// "START "A","B"" -> ["A", "B"]; "END 0" -> []. Used only to label a rule as a fan-out.
+function ruleTargets(action) {
+  const m = /^\s*START\s+(.*)$/i.exec(action || "");
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
+}
+
+function ruleShape(rule) {
+  const targets = ruleTargets(rule.action);
+  if (/^\s*END\b/i.test(rule.action || "")) return "end";
+  if (targets.length > 1) return "fan-out";
+  if (/\bAND\b/i.test(rule.condition || "")) return "join";
+  if (/\bFAILED\b/i.test(rule.condition || "")) return "on failure";
+  return "";
+}
+
+function renderProcesses(jobs, chains) {
+  const box = $("#processes");
+  box.replaceChildren();
+  if (!jobs.length && !chains.length) {
+    box.append(el("p", { class: "muted", text:
+      "This schema schedules nothing — no DBMS_SCHEDULER jobs or chains were found." }));
+    return;
+  }
+
+  jobs.forEach((j) => {
+    const card = el("div", { class: "program-card" });
+    card.append(el("div", { class: "program-head" },
+      el("code", { text: j.name }),
+      el("span", { class: "pill", text: j.job_type || "JOB" }),
+      el("span", { class: "badge " + (j.enabled ? "high" : "low"),
+                   text: j.state || (j.enabled ? "enabled" : "disabled") })
+    ));
+    if (j.comment) card.append(el("p", { text: j.comment }));
+    const facts = [];
+    if (j.job_action) facts.push("Runs: " + j.job_action);
+    if (j.repeat_interval) facts.push("Cadence: " + j.repeat_interval);
+    if (j.next_run) facts.push("Next: " + j.next_run);
+    if (j.last_start) facts.push("Last: " + j.last_start);
+    facts.push("Restartable: " + (j.restartable ? "yes" : "no"));
+    card.append(el("p", { class: "muted small", text: facts.join(" · ") }));
+    box.append(card);
+  });
+
+  chains.forEach((c) => {
+    const card = el("div", { class: "program-card" });
+    card.append(el("div", { class: "program-head" },
+      el("code", { text: c.name }),
+      el("span", { class: "pill", text: "CHAIN" }),
+      el("span", { class: "badge " + (c.enabled ? "high" : "low"),
+                   text: c.enabled ? "enabled" : "disabled" })
+    ));
+    if (c.comment) card.append(el("p", { text: c.comment }));
+    card.append(el("p", { class: "muted small",
+      text: `${c.steps.length} step(s) · ${c.rules.length} rule(s)` }));
+
+    const steps = el("table", { class: "proc-table" });
+    steps.append(el("thead", {}, el("tr", {},
+      el("th", { text: "Step" }), el("th", { text: "Calls" }), el("th", { text: "What it does" }))));
+    const sbody = el("tbody", {});
+    c.steps.forEach((s) => sbody.append(el("tr", {},
+      el("td", {}, el("code", { text: s.name })),
+      el("td", {}, el("code", { text: s.action || s.program || "—" })),
+      el("td", { class: "muted small", text: s.does || "" })
+    )));
+    steps.append(sbody);
+    card.append(steps);
+
+    const rules = el("table", { class: "proc-table" });
+    rules.append(el("thead", {}, el("tr", {},
+      el("th", { text: "Rule" }), el("th", { text: "When" }), el("th", { text: "Then" }))));
+    const rbody = el("tbody", {});
+    c.rules.forEach((r) => {
+      const shape = ruleShape(r);
+      rbody.append(el("tr", {},
+        el("td", {}, el("code", { text: r.name })),
+        el("td", { class: "small", text: r.condition }),
+        el("td", { class: "small" },
+          el("code", { text: r.action }),
+          shape ? el("span", { class: "pill", text: shape }) : el("span", {}))
+      ));
+    });
+    rules.append(rbody);
+    card.append(rules);
+    box.append(card);
+  });
+}
+
+$("#proc-search").addEventListener("input", (e) => {
+  const q = e.target.value.toLowerCase();
+  const hit = (s) => (s || "").toLowerCase().includes(q);
+  renderProcesses(
+    (MAP.scheduler_jobs || []).filter((j) => hit(j.name) || hit(j.job_action) || hit(j.comment)),
+    (MAP.scheduler_chains || []).filter((c) =>
+      hit(c.name) || hit(c.comment) ||
+      c.steps.some((s) => hit(s.name) || hit(s.action) || hit(s.does)) ||
+      c.rules.some((r) => hit(r.name) || hit(r.condition) || hit(r.action)))
+  );
 });
 
 // --- application logs -------------------------------------------------------

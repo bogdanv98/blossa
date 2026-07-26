@@ -141,3 +141,89 @@ def test_offline_ddl_synthesizes_tables_from_the_map():
     report = _report()
     name = report.schema_info.tables[0].name
     assert "CREATE TABLE" in offline_ddl(report, None, name, "TABLE")
+
+
+# ---------------------------------------------------------------- scheduler DDL
+
+
+def test_scheduler_objects_map_to_procobj():
+    """Oracle fetches every DBMS_SCHEDULER object under PROCOBJ, not under its catalog name.
+    Without this the DDL pane just says 'no DDL available' for a whole scheduled batch."""
+    for kind in ("JOB", "PROGRAM", "CHAIN", "SCHEDULE", "JOB CLASS"):
+        assert metadata_type(kind) == "PROCOBJ"
+    assert metadata_type("TABLE") == "TABLE"
+    assert metadata_type("NOT A THING") is None
+
+
+def _chain():
+    from blossa.models import SchedulerChain, SchedulerRule, SchedulerStep
+
+    return SchedulerChain(
+        name="EOD_CHAIN", owner="BANKDEMO", enabled=True, comment="Nightly batch.",
+        steps=[
+            SchedulerStep(name="S01_OPEN", program_owner="BANKDEMO", program_name="PRG_S01",
+                          action="BANKDEMO.eod_batch.s01_open"),
+            SchedulerStep(name="S02_SETTLE", program_owner="BANKDEMO", program_name="PRG_S02"),
+        ],
+        rules=[
+            SchedulerRule(name="R00", condition="TRUE", action='START "S01_OPEN"'),
+            SchedulerRule(name="R01", condition="S01_OPEN SUCCEEDED", action="END 0"),
+        ],
+    )
+
+
+def test_offline_chain_ddl_rebuilds_steps_and_rules():
+    from blossa.ddl import synthesize_chain_ddl
+
+    ddl = synthesize_chain_ddl(_chain())
+    assert "DBMS_SCHEDULER.CREATE_CHAIN(chain_name => 'BANKDEMO.EOD_CHAIN'" in ddl
+    assert "DEFINE_CHAIN_STEP('BANKDEMO.EOD_CHAIN', 'S01_OPEN', 'BANKDEMO.PRG_S01')" in ddl
+    # The rules are the graph — a chain script without them recreates an inert chain.
+    assert "condition => 'S01_OPEN SUCCEEDED'" in ddl
+    assert "action    => 'END 0'" in ddl
+    assert "DBMS_SCHEDULER.ENABLE('BANKDEMO.EOD_CHAIN')" in ddl
+    # The step's resolved procedure is carried as a comment, so the script stays runnable.
+    assert "-- calls BANKDEMO.eod_batch.s01_open" in ddl
+
+
+def test_offline_chain_ddl_quotes_a_comment_containing_an_apostrophe():
+    chain = _chain()
+    chain.comment = "The bank's nightly close."
+    from blossa.ddl import synthesize_chain_ddl
+
+    assert "'The bank''s nightly close.'" in synthesize_chain_ddl(chain)
+
+
+def test_offline_job_ddl_rebuilds_the_create_job_call():
+    from blossa.ddl import synthesize_job_ddl
+    from blossa.models import SchedulerJob
+
+    job = SchedulerJob(
+        name="EOD_BATCH_JOB", owner="BANKDEMO", job_type="CHAIN",
+        job_action="BANKDEMO.EOD_CHAIN", repeat_interval="FREQ=DAILY; BYHOUR=23",
+        enabled=True, restartable=True,
+    )
+    ddl = synthesize_job_ddl(job)
+    assert "job_type        => 'CHAIN'" in ddl
+    assert "job_action      => 'BANKDEMO.EOD_CHAIN'" in ddl
+    assert "repeat_interval => 'FREQ=DAILY; BYHOUR=23'" in ddl
+    assert "'restartable', TRUE" in ddl
+
+
+def test_offline_ddl_finds_a_chain_and_a_job_in_the_map():
+    """The endpoint's fallback path: no live DBMS_METADATA, answer from the scan."""
+    from blossa.models import SchedulerJob
+
+    report = ScanReport(
+        metadata=ScanMetadata(blossa_version="t", schema_name="BANKDEMO",
+                              generated_at=datetime(2026, 1, 1), llm_provider="heuristic"),
+        schema_info=build_demo_schema(),
+    )
+    report.schema_info.scheduler_chains.append(_chain())
+    report.schema_info.scheduler_jobs.append(
+        SchedulerJob(name="EOD_BATCH_JOB", owner="BANKDEMO", job_type="CHAIN",
+                     job_action="BANKDEMO.EOD_CHAIN", enabled=True)
+    )
+    assert "DEFINE_CHAIN_RULE" in offline_ddl(report, "BANKDEMO", "EOD_CHAIN", "CHAIN")
+    assert "CREATE_JOB" in offline_ddl(report, "BANKDEMO", "EOD_BATCH_JOB", "JOB")
+    assert offline_ddl(report, "BANKDEMO", "NOPE", "CHAIN") == ""

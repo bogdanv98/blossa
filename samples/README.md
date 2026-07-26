@@ -144,6 +144,57 @@ Against the demo container (HR + CFKDEMO + EXTSALES installed) this discovers ex
 schemas, scans all 11 tables, and re-infers every relationship — single-column, composite, and
 cross-schema — in one pass.
 
+## Scheduled batch process (DBMS_SCHEDULER chain)
+
+[bank_eod_chain.sql](bank_eod_chain.sql) adds a realistic **end-of-day core-banking batch** on top of
+the `BANKDEMO` schema: not one monolithic job, but a `DBMS_SCHEDULER` **chain** of 12 steps with two
+parallel fan-outs, two AND joins and an error branch — the shape a real nightly batch actually has.
+
+```
+S01_OPEN_BUSINESS_DATE                       cut-off, open the accounting day
+  ├─ S02_INGEST_CLEARING                     inbound SEPA clearing file
+  └─ S03_RESET_CARD_LIMITS                   roll card daily-spend counters
+       (AND) → S04_SETTLE_PENDING            post to balances + double-entry GL
+         ├─ S05_ACCRUE_INTEREST → S08_DELINQUENCY    ACT/365 accrual → DPD buckets, IFRS 9
+         ├─ S06_APPLY_FEES                   overdraft + month-end maintenance
+         └─ S07_AML_SCREEN                   structuring / high value / dormancy / pass-through
+              (AND) → S09_RECONCILE → S10_REGULATORY_EXTRACT → S11_CLOSE_BATCH → END 0
+any step FAILED → S99_FAIL_HANDLER → END 1
+```
+
+It adds 12 tables (`EOD_RUN`, `GL_ENTRY`, `AML_ALERT`, `LOAN_ARREARS`, `RECON_BREAK`, …), the
+`EOD_BATCH` package, 12 scheduler programs, the chain itself and a nightly job at 23:05. Requires
+`applog_demo.sql` and `bank_demo.sql` first.
+
+```bash
+docker cp samples/bank_eod_chain.sql blossa-oracle:/tmp/bank_eod_chain.sql
+docker exec -i blossa-oracle sqlplus -s system/oracle@//localhost:1521/XEPDB1 @/tmp/bank_eod_chain.sql
+# run one night on demand (the chain is asynchronous — watch BANKDEMO.EOD_RUN for the outcome)
+docker exec -i blossa-oracle sqlplus -s system/oracle@//localhost:1521/XEPDB1 <<'SQL'
+EXEC DBMS_SCHEDULER.RUN_JOB('BANKDEMO.EOD_BATCH_JOB', use_current_session => FALSE);
+SELECT run_id, business_date, attempt_no, status FROM bankdemo.eod_run ORDER BY run_id;
+SQL
+```
+
+What it gives Blossa to find, beyond the tables: a scheduler dependency graph, a package whose
+procedures map one-to-one onto chain steps, cross-schema writes into `APPLOG.JOB_RUN_LOG` and
+`APPLOG.ERROR_LOG`, and one deliberately **undeclared** FK (`GL_ENTRY.ACCOUNT_ID → ACCOUNTS`, left
+unenforceable because a real ledger also books to internal accounts).
+
+To exercise the error branch, arm the test hook and run a night — the failed day is then retried on
+the **same** business date as attempt 2, and the money-moving steps refuse to post twice:
+
+```sql
+EXEC BANKDEMO.EOD_BATCH.SET_PARAM('FORCE_FAIL_STEP', 'S06_APPLY_FEES');
+-- ... run a night, then clear it:
+EXEC BANKDEMO.EOD_BATCH.SET_PARAM('FORCE_FAIL_STEP', NULL);
+```
+
+Installing it rewrites `LOANS.OPENED_AT` to backdate the loan book — those loans are only weeks old,
+so no instalment of theirs could ever be late and the arrears step would have nothing to classify.
+
+(On Windows/Git Bash, prefix the `docker exec ... @/tmp/...` lines with `MSYS_NO_PATHCONV=1`.)
+
 ## Note
 
 These are throwaway sample databases meant for testing. `legacy_ify.sql` is **destructive** — only

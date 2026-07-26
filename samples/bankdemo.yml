@@ -1,0 +1,19 @@
+# Config for scanning the BANKDEMO core-banking demo schema, including the end-of-day
+# DBMS_SCHEDULER chain installed by bank_eod_chain.sql (see samples/README.md).
+oracle:
+  dsn: "localhost:1521/XEPDB1"
+  user: "BANKDEMO"
+  password: "oracle"
+  schema: "BANKDEMO"
+
+llm:
+  # The real semantic pass. Swap to "heuristic" for a fast offline baseline.
+  provider: "ollama"
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "qwen2.5:14b"
+    timeout: 120
+
+output:
+  dir: "samples/out"
+  name: "bankdemo_map"

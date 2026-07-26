@@ -15,6 +15,10 @@ from ..models import (
     IndexInfo,
     ProgramKind,
     ProgramUnit,
+    SchedulerChain,
+    SchedulerJob,
+    SchedulerRule,
+    SchedulerStep,
     SchemaInfo,
     TableInfo,
 )
@@ -115,6 +119,11 @@ _VIEWS_SQL = """
 _OBJECT_TYPES = (
     "TABLE", "VIEW", "PACKAGE", "PROCEDURE", "FUNCTION", "TRIGGER",
     "SEQUENCE", "SYNONYM", "MATERIALIZED VIEW", "TYPE", "INDEX",
+    # Scheduler objects: a scheduled batch is part of what a schema *is*, and leaving these out
+    # made a whole nightly process invisible. RULE / RULE SET / EVALUATION CONTEXT are omitted on
+    # purpose — Oracle creates them as a chain's internal plumbing, and the rules are surfaced far
+    # more usefully as the chain's edges (see `scheduler_chains`) than as anonymous catalog rows.
+    "JOB", "PROGRAM", "CHAIN", "SCHEDULE", "JOB CLASS",
 )
 
 _OBJECTS_SQL = """
@@ -125,6 +134,52 @@ _OBJECTS_SQL = """
        AND OBJECT_NAME NOT LIKE 'BIN$%'
        AND GENERATED = 'N'
      ORDER BY OBJECT_TYPE, OBJECT_NAME
+"""
+
+# --- DBMS_SCHEDULER --------------------------------------------------------------------------
+# A chain is the only place the *order* of a batch is written down: the steps say which program
+# each node runs, and the rules are the edges between them (fan-out, AND joins, error branch).
+# Reading the packages alone shows the procedures but never the graph that drives them.
+#
+# Column lists here are the real ones from the 21c dictionary — verified, not assumed. ALL_ and
+# DBA_ variants carry identical columns, so the view name swaps with the catalog scope.
+
+_SCHED_CHAINS_SQL = """
+    SELECT CHAIN_NAME, ENABLED, COMMENTS
+      FROM {view}
+     WHERE OWNER = :owner
+     ORDER BY CHAIN_NAME
+"""
+
+_SCHED_STEPS_SQL = """
+    SELECT CHAIN_NAME, STEP_NAME, PROGRAM_OWNER, PROGRAM_NAME, STEP_TYPE
+      FROM {view}
+     WHERE OWNER = :owner
+     ORDER BY CHAIN_NAME, STEP_NAME
+"""
+
+_SCHED_RULES_SQL = """
+    SELECT CHAIN_NAME, RULE_NAME, CONDITION, ACTION, COMMENTS
+      FROM {view}
+     WHERE OWNER = :owner
+     ORDER BY CHAIN_NAME, RULE_NAME
+"""
+
+_SCHED_PROGRAMS_SQL = """
+    SELECT PROGRAM_NAME, PROGRAM_ACTION
+      FROM {view}
+     WHERE OWNER = :owner
+"""
+
+# JOB_SUBNAME is set on the per-step job rows the scheduler spawns while a chain runs; those are
+# transient execution detail, not objects the schema declares.
+_SCHED_JOBS_SQL = """
+    SELECT JOB_NAME, JOB_TYPE, JOB_ACTION, PROGRAM_NAME, REPEAT_INTERVAL,
+           ENABLED, STATE, RESTARTABLE, LAST_START_DATE, NEXT_RUN_DATE, COMMENTS
+      FROM {view}
+     WHERE OWNER = :owner
+       AND JOB_SUBNAME IS NULL
+     ORDER BY JOB_NAME
 """
 
 # ALL_SOURCE.TYPE -> the program kind we expose (spec and body both fold into one PACKAGE unit).
@@ -170,6 +225,8 @@ def introspect_schema(db: QueryExecutor, owner: str, use_dba: bool = False) -> S
         )
     schema.program_units = _build_program_units(db, owner, binds, use_dba)
     schema.objects = _build_catalog_objects(db, owner, binds, use_dba)
+    schema.scheduler_chains = _build_scheduler_chains(db, owner, binds, use_dba)
+    schema.scheduler_jobs = _build_scheduler_jobs(db, owner, binds, use_dba)
     return schema
 
 
@@ -393,6 +450,108 @@ def _build_catalog_objects(
     ]
 
 
+def _sched_rows(
+    db: QueryExecutor, sql: str, view: str, binds: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Run one scheduler-dictionary query, tolerating an account that cannot see the view.
+
+    The scheduler views are readable by any account for its own objects, but a locked-down or
+    pre-10g target may still refuse. A refusal means "no scheduler section", never a failed scan.
+    """
+    try:
+        return db.query(sql.format(view=view), binds)  # noqa: S608 - view is a constant
+    except Exception:  # noqa: BLE001 - no access to the scheduler catalog: skip, keep scanning
+        return []
+
+
+def _build_scheduler_chains(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
+) -> list[SchedulerChain]:
+    """Read every job chain the owner declares, with its steps and its rules."""
+    prefix = "DBA" if use_dba else "ALL"
+    chains = _sched_rows(db, _SCHED_CHAINS_SQL, f"{prefix}_SCHEDULER_CHAINS", binds)
+    if not chains:
+        return []
+
+    steps = _sched_rows(db, _SCHED_STEPS_SQL, f"{prefix}_SCHEDULER_CHAIN_STEPS", binds)
+    rules = _sched_rows(db, _SCHED_RULES_SQL, f"{prefix}_SCHEDULER_CHAIN_RULES", binds)
+    programs = _sched_rows(db, _SCHED_PROGRAMS_SQL, f"{prefix}_SCHEDULER_PROGRAMS", binds)
+
+    # A step points at a program; the program points at the procedure. Resolving it here is what
+    # lets a reader jump from "step S04" to the packaged routine the Logic tab already explains.
+    action_by_program = {
+        r["PROGRAM_NAME"]: (_to_text(r.get("PROGRAM_ACTION")) or "").strip() for r in programs
+    }
+
+    steps_by_chain: dict[str, list[SchedulerStep]] = {}
+    for r in steps:
+        program_owner = r.get("PROGRAM_OWNER")
+        program_name = r.get("PROGRAM_NAME")
+        steps_by_chain.setdefault(r["CHAIN_NAME"], []).append(
+            SchedulerStep(
+                name=r["STEP_NAME"],
+                program_owner=program_owner,
+                program_name=program_name,
+                step_type=(r.get("STEP_TYPE") or "").strip(),
+                # Only own-schema programs were read, so a cross-schema step keeps an empty action
+                # rather than borrowing an unrelated program of the same name.
+                action=(
+                    action_by_program.get(program_name, "")
+                    if program_owner == owner
+                    else ""
+                ),
+            )
+        )
+
+    rules_by_chain: dict[str, list[SchedulerRule]] = {}
+    for r in rules:
+        rules_by_chain.setdefault(r["CHAIN_NAME"], []).append(
+            SchedulerRule(
+                name=r["RULE_NAME"],
+                condition=(_to_text(r.get("CONDITION")) or "").strip(),
+                action=(_to_text(r.get("ACTION")) or "").strip(),
+                comment=_to_text(r.get("COMMENTS")),
+            )
+        )
+
+    return [
+        SchedulerChain(
+            name=c["CHAIN_NAME"],
+            owner=owner,
+            enabled=(c.get("ENABLED") or "").upper() == "TRUE",
+            comment=_to_text(c.get("COMMENTS")),
+            steps=steps_by_chain.get(c["CHAIN_NAME"], []),
+            rules=rules_by_chain.get(c["CHAIN_NAME"], []),
+        )
+        for c in chains
+    ]
+
+
+def _build_scheduler_jobs(
+    db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
+) -> list[SchedulerJob]:
+    """Read the owner's scheduled jobs — what runs, on what cadence, and whether it is armed."""
+    prefix = "DBA" if use_dba else "ALL"
+    rows = _sched_rows(db, _SCHED_JOBS_SQL, f"{prefix}_SCHEDULER_JOBS", binds)
+    return [
+        SchedulerJob(
+            name=r["JOB_NAME"],
+            owner=owner,
+            job_type=(r.get("JOB_TYPE") or "").strip(),
+            job_action=(_to_text(r.get("JOB_ACTION")) or "").strip(),
+            program_name=r.get("PROGRAM_NAME"),
+            repeat_interval=(_to_text(r.get("REPEAT_INTERVAL")) or "").strip(),
+            enabled=(r.get("ENABLED") or "").upper() == "TRUE",
+            state=(r.get("STATE") or "").strip(),
+            restartable=(r.get("RESTARTABLE") or "").upper() == "TRUE",
+            last_start=_as_stamp(r.get("LAST_START_DATE")),
+            next_run=_as_stamp(r.get("NEXT_RUN_DATE")),
+            comment=_to_text(r.get("COMMENTS")),
+        )
+        for r in rows
+    ]
+
+
 def _plsql_units(
     db: QueryExecutor, owner: str, binds: dict[str, Any], use_dba: bool
 ) -> list[ProgramUnit]:
@@ -465,6 +624,16 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_stamp(value: Any) -> str:
+    """A scheduler timestamp as a plain 'YYYY-MM-DD HH:MM' string (they arrive tz-aware)."""
+    if value is None:
+        return ""
+    try:
+        return value.strftime("%Y-%m-%d %H:%M")
+    except AttributeError:
+        return str(value)
 
 
 def _clean_default(value: Any) -> str | None:

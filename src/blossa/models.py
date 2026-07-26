@@ -225,6 +225,67 @@ class CatalogObject(BaseModel):
     status: str = ""  # VALID / INVALID
 
 
+class SchedulerStep(BaseModel):
+    """One node of a DBMS_SCHEDULER job chain.
+
+    A step names the program it runs; `action` is that program's target resolved from
+    ALL_SCHEDULER_PROGRAMS, which is what ties the step back to a procedure the Logic tab
+    already explains. It stays empty when the program lives in a schema we cannot read.
+    """
+
+    name: str
+    program_owner: str | None = None
+    program_name: str | None = None
+    step_type: str = ""  # PROGRAM / EVENT
+    action: str = ""  # e.g. "BANKDEMO.eod_batch.s04_settle_pending"
+
+
+class SchedulerRule(BaseModel):
+    """One edge of a job chain: when CONDITION holds, do ACTION.
+
+    The rules — not the steps — are where a chain's order lives: "START X", "START X, Y" for a
+    parallel fan-out, "X SUCCEEDED AND Y SUCCEEDED" for a join, "END 0" for a clean finish.
+    """
+
+    name: str
+    condition: str = ""
+    action: str = ""
+    comment: str | None = None
+
+
+class SchedulerChain(BaseModel):
+    """A DBMS_SCHEDULER chain: the dependency graph of a multi-step batch process."""
+
+    name: str
+    owner: str | None = None
+    enabled: bool = False
+    comment: str | None = None
+    steps: list[SchedulerStep] = Field(default_factory=list)
+    rules: list[SchedulerRule] = Field(default_factory=list)
+
+
+class SchedulerJob(BaseModel):
+    """A scheduled job. `job_action` names what it runs — for a CHAIN job, the chain itself."""
+
+    name: str
+    owner: str | None = None
+    job_type: str = ""  # CHAIN / PLSQL_BLOCK / STORED_PROCEDURE / EXECUTABLE
+    job_action: str = ""
+    program_name: str | None = None  # set instead of job_action when the job runs a program
+    repeat_interval: str = ""
+    enabled: bool = False
+    state: str = ""  # SCHEDULED / RUNNING / DISABLED / BROKEN
+    restartable: bool = False
+    last_start: str = ""
+    next_run: str = ""
+    comment: str | None = None
+
+    @property
+    def runs_chain(self) -> str:
+        """The chain this job drives, or '' if it runs something else."""
+        return self.job_action if self.job_type.upper() == "CHAIN" else ""
+
+
 class SchemaInfo(BaseModel):
     """The whole introspected schema."""
 
@@ -232,6 +293,8 @@ class SchemaInfo(BaseModel):
     tables: list[TableInfo] = Field(default_factory=list)
     program_units: list[ProgramUnit] = Field(default_factory=list)
     objects: list[CatalogObject] = Field(default_factory=list)
+    scheduler_chains: list[SchedulerChain] = Field(default_factory=list)
+    scheduler_jobs: list[SchedulerJob] = Field(default_factory=list)
 
     def table(self, name: str) -> TableInfo | None:
         return next((t for t in self.tables if t.name == name), None)

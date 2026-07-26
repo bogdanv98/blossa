@@ -469,3 +469,80 @@ def test_object_tree_lists_every_category_it_supports():
                   "Materialized views", "Sequences", "Synonyms", "Types", "Indexes"):
         assert f'label: "{label}"' in js
     assert "empty ones included" in js  # the rule is stated where it is implemented
+
+
+def test_map_view_serves_the_chain_its_steps_and_rules():
+    from blossa.models import SchedulerChain, SchedulerJob, SchedulerRule, SchedulerStep
+
+    report = _report()
+    report.schema_info.scheduler_jobs.append(
+        SchedulerJob(
+            name="EOD_BATCH_JOB", owner="BLOSSA_DEMO", job_type="CHAIN",
+            job_action="BLOSSA_DEMO.EOD_CHAIN", repeat_interval="FREQ=DAILY; BYHOUR=23",
+            enabled=True, state="SCHEDULED", restartable=True,
+        )
+    )
+    report.schema_info.scheduler_chains.append(
+        SchedulerChain(
+            name="EOD_CHAIN", owner="BLOSSA_DEMO", enabled=True, comment="Nightly batch.",
+            steps=[
+                SchedulerStep(name="S01_OPEN", program_owner="BLOSSA_DEMO",
+                              program_name="PRG_S01", step_type="PROGRAM",
+                              action="BLOSSA_DEMO.eod_batch.s01_open"),
+            ],
+            rules=[
+                SchedulerRule(name="R00", condition="TRUE", action='START "S01_OPEN"'),
+                SchedulerRule(name="R01", condition="S01_OPEN SUCCEEDED", action="END 0"),
+            ],
+        )
+    )
+    view = build_map_view(report)
+
+    job = view["scheduler_jobs"][0]
+    assert job["runs_chain"] == "BLOSSA_DEMO.EOD_CHAIN"
+    assert job["repeat_interval"].startswith("FREQ=DAILY")
+
+    chain = view["scheduler_chains"][0]
+    assert chain["name"] == "EOD_CHAIN" and chain["enabled"] is True
+    # The rules carry the order; without them the UI could only list steps alphabetically.
+    assert [r["action"] for r in chain["rules"]] == ['START "S01_OPEN"', "END 0"]
+    # A step is shown with the procedure it calls, so a reader can carry the name to the Logic tab.
+    assert chain["steps"][0]["action"] == "BLOSSA_DEMO.eod_batch.s01_open"
+    assert chain["steps"][0]["package"] == "EOD_BATCH"
+    assert chain["steps"][0]["routine"] == "S01_OPEN"
+
+
+def test_map_view_has_empty_scheduler_lists_when_nothing_is_scheduled():
+    view = build_map_view(_report())
+    assert view["scheduler_chains"] == []
+    assert view["scheduler_jobs"] == []
+
+
+def test_shell_stamps_its_assets_so_a_stale_bundle_cannot_be_reused():
+    """A cached app.js paired with a newer server hides shipped UI. The stamp makes that
+    impossible, and it must turn over when the asset changes — not only on a release."""
+    client = _client(heuristic=True)
+    html = client.get("/").text
+    assert "__ASSET_VERSION__" not in html  # the placeholder must be substituted
+    import re
+
+    stamps = re.findall(r'/static/(?:app\.js|style\.css)\?v=([0-9a-f]+)', html)
+    assert len(stamps) == 2 and all(stamps)
+    assert client.get("/").headers["cache-control"] == "no-cache"
+
+
+def test_static_assets_must_revalidate():
+    client = _client(heuristic=True)
+    assert client.get("/static/app.js").headers["cache-control"] == "no-cache"
+
+
+def test_asset_stamp_changes_when_a_static_file_changes(tmp_path, monkeypatch):
+    from blossa.web import server as srv
+
+    first = srv._asset_version()
+    real = srv._STATIC_DIR / "app.js"
+    copy = tmp_path / "app.js"
+    copy.write_bytes(real.read_bytes() + b"\n// changed\n")
+    (tmp_path / "style.css").write_bytes((srv._STATIC_DIR / "style.css").read_bytes())
+    monkeypatch.setattr(srv, "_STATIC_DIR", tmp_path)
+    assert srv._asset_version() != first

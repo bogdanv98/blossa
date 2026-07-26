@@ -158,3 +158,102 @@ def test_blocklist_fallback_query_excludes_system_owners():
     list_non_system_schemas(_Capture())
     assert "'SYS'" in captured["sql"] and "'SYSTEM'" in captured["sql"]
     assert "APEX_%" in captured["sql"]
+
+
+# ------------------------------------------------------------------- scheduler
+
+
+class _SchedulerDB:
+    """A schema whose only interesting content is a two-step job chain and the job that runs it."""
+
+    def query(self, sql: str, binds=None):
+        s = sql.upper()
+        if "ALL_SCHEDULER_CHAIN_STEPS" in s:
+            return [
+                {"CHAIN_NAME": "EOD_CHAIN", "STEP_NAME": "S01_OPEN", "PROGRAM_OWNER": "BANKDEMO",
+                 "PROGRAM_NAME": "PRG_S01_OPEN", "STEP_TYPE": "PROGRAM"},
+                # A step whose program lives elsewhere: the action must stay empty rather than
+                # borrow the same-named program from this schema.
+                {"CHAIN_NAME": "EOD_CHAIN", "STEP_NAME": "S02_SETTLE", "PROGRAM_OWNER": "OTHER",
+                 "PROGRAM_NAME": "PRG_S01_OPEN", "STEP_TYPE": "PROGRAM"},
+            ]
+        if "ALL_SCHEDULER_CHAIN_RULES" in s:
+            return [
+                {"CHAIN_NAME": "EOD_CHAIN", "RULE_NAME": "R00", "CONDITION": "TRUE",
+                 "ACTION": 'START "S01_OPEN"', "COMMENTS": "Entry point."},
+                {"CHAIN_NAME": "EOD_CHAIN", "RULE_NAME": "R01",
+                 "CONDITION": "S01_OPEN SUCCEEDED", "ACTION": 'START "S02_SETTLE"',
+                 "COMMENTS": None},
+            ]
+        if "ALL_SCHEDULER_CHAINS" in s:
+            return [{"CHAIN_NAME": "EOD_CHAIN", "ENABLED": "TRUE", "COMMENTS": "Nightly batch."}]
+        if "ALL_SCHEDULER_PROGRAMS" in s:
+            return [{"PROGRAM_NAME": "PRG_S01_OPEN",
+                     "PROGRAM_ACTION": "BANKDEMO.eod_batch.s01_open"}]
+        if "ALL_SCHEDULER_JOBS" in s:
+            return [{"JOB_NAME": "EOD_BATCH_JOB", "JOB_TYPE": "CHAIN",
+                     "JOB_ACTION": "BANKDEMO.EOD_CHAIN", "PROGRAM_NAME": None,
+                     "REPEAT_INTERVAL": "FREQ=DAILY; BYHOUR=23", "ENABLED": "TRUE",
+                     "STATE": "SCHEDULED", "RESTARTABLE": "TRUE",
+                     "LAST_START_DATE": None, "NEXT_RUN_DATE": None, "COMMENTS": None}]
+        if "ALL_TABLES" in s:
+            return []
+        return []
+
+
+def test_scheduler_chain_carries_its_steps_and_rules():
+    schema = introspect_schema(_SchedulerDB(), "BANKDEMO")
+    assert len(schema.scheduler_chains) == 1
+    chain = schema.scheduler_chains[0]
+    assert chain.name == "EOD_CHAIN"
+    assert chain.enabled is True
+    assert [s.name for s in chain.steps] == ["S01_OPEN", "S02_SETTLE"]
+    # The rules are the edges — without them the chain has no order at all.
+    assert [r.condition for r in chain.rules] == ["TRUE", "S01_OPEN SUCCEEDED"]
+    assert chain.rules[0].action == 'START "S01_OPEN"'
+
+
+def test_scheduler_step_resolves_to_the_procedure_it_calls():
+    chain = introspect_schema(_SchedulerDB(), "BANKDEMO").scheduler_chains[0]
+    assert chain.steps[0].action == "BANKDEMO.eod_batch.s01_open"
+    # Cross-schema program: not resolvable from this owner's programs, so left blank.
+    assert chain.steps[1].action == ""
+    assert chain.steps[1].program_owner == "OTHER"
+
+
+def test_scheduler_job_points_at_the_chain_it_drives():
+    job = introspect_schema(_SchedulerDB(), "BANKDEMO").scheduler_jobs[0]
+    assert job.job_type == "CHAIN"
+    assert job.runs_chain == "BANKDEMO.EOD_CHAIN"
+    assert job.enabled is True and job.restartable is True
+    assert job.repeat_interval.startswith("FREQ=DAILY")
+
+
+def test_scheduler_objects_reach_the_browsable_inventory():
+    """A JOB/CHAIN/PROGRAM must survive the object-type allowlist, or a whole batch is invisible."""
+
+    class _Objects(_SchedulerDB):
+        def query(self, sql: str, binds=None):
+            if "ALL_OBJECTS" in sql.upper():
+                return [
+                    {"OBJECT_NAME": "EOD_CHAIN", "OBJECT_TYPE": "CHAIN", "STATUS": "VALID"},
+                    {"OBJECT_NAME": "EOD_BATCH_JOB", "OBJECT_TYPE": "JOB", "STATUS": "VALID"},
+                ]
+            return super().query(sql, binds)
+
+    types = {o.type for o in introspect_schema(_Objects(), "BANKDEMO").objects}
+    assert types == {"CHAIN", "JOB"}
+
+
+def test_a_schema_without_scheduler_access_still_scans():
+    """The scheduler views are optional: a refusal must not cost the caller its tables."""
+
+    class _Refuses(FakeDB):
+        def query(self, sql: str, binds=None):
+            if "SCHEDULER" in sql.upper():
+                raise RuntimeError("ORA-00942: table or view does not exist")
+            return super().query(sql, binds)
+
+    schema = introspect_schema(_Refuses(), "BLOSSA_DEMO")
+    assert {t.name for t in schema.tables} == {"CUSTOMERS", "ORDERS"}
+    assert schema.scheduler_chains == [] and schema.scheduler_jobs == []

@@ -208,6 +208,25 @@ th.sortable:hover { background: #f0f0f2; }
 .program-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .program-head code { font-size: 14px; font-weight: 600; }
 
+/* Scheduled processes ---------------------------------------------------- */
+#proc-search {
+  width: 100%; padding: 9px 12px; border: 1px solid var(--line);
+  border-radius: 8px; margin-bottom: 6px; background: var(--panel);
+}
+/* Conditions and actions are long single-line strings, so the table scrolls rather than
+   forcing the page to. */
+.proc-table {
+  width: 100%; margin-top: 12px; border-collapse: collapse;
+  display: block; overflow-x: auto;
+}
+.proc-table th, .proc-table td {
+  text-align: left; vertical-align: top; padding: 5px 10px 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+.proc-table th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+.proc-table td code { font-size: 13px; }
+.proc-table .pill { margin-left: 6px; }
+
 /* Application logs ------------------------------------------------------- */
 #logs-search {
   width: 100%; padding: 9px 12px; border: 1px solid var(--line);

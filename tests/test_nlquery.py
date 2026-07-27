@@ -3,12 +3,24 @@
 
 """Pure NL→SQL logic for `blossa ask`: context, parsing, the read-only guard, the row cap."""
 
+import json
+
 import pytest
 
 from blossa.config import Settings
 from blossa.demo import build_demo_schema
 from blossa.llm.heuristic import HeuristicProvider
-from blossa.models import ConfidenceLevel, LogColumn, LogKind, LogRole, LogTable
+from blossa.models import (
+    ColumnInfo,
+    ConfidenceLevel,
+    LogColumn,
+    LogKind,
+    LogRole,
+    LogTable,
+    Relationship,
+    ScanReport,
+    TableInfo,
+)
 from blossa.nlquery import (
     _MAX_HISTORY,
     AskResult,
@@ -18,11 +30,14 @@ from blossa.nlquery import (
     build_ask_prompt,
     build_schema_context,
     catalog_reference,
+    column_facts_for_error,
     expand_count_to_list,
     parse_ask_response,
     privilege_hint,
+    repair_invalid_sql,
     unknown_dictionary_views,
     validate_read_only_select,
+    warn_on_fan_out,
     with_row_limit,
 )
 from blossa.pipeline import run_scan_over_schema
@@ -639,3 +654,149 @@ END core_banking;"""))
     assert "CORE_BANKING" in res.explanation
     assert "APPLY_MONTHLY_INTEREST" in res.explanation  # the routine, not just the package
     assert "Applies the monthly interest" in res.explanation  # and what it does
+
+
+# ------------------------------------------------- compile-check, repair, fan-out
+
+
+def _banking_report() -> ScanReport:
+    """A customer with two independent detail branches — the shape that fans out."""
+    report = _demo_report()
+    report.schema_info.tables = [
+        TableInfo(name=name, owner="BANKDEMO")
+        for name in ("CUSTOMERS", "LOANS", "FEE_CHARGE", "AML_ALERT", "LOAN_ARREARS")
+    ]
+    report.relationships = []
+    def rel(child: str, parent: str) -> Relationship:
+        return Relationship(
+            from_table=child, from_columns=["X_ID"], to_table=parent, to_columns=["ID"],
+            declared=True,
+        )
+    report.relationships.extend([
+        rel("LOANS", "CUSTOMERS"),
+        rel("FEE_CHARGE", "CUSTOMERS"),
+        rel("AML_ALERT", "CUSTOMERS"),
+        rel("LOAN_ARREARS", "LOANS"),
+    ])
+    return report
+
+
+class _Model:
+    """A provider that answers a repair request with whatever it was handed."""
+
+    def __init__(self, sql: str):
+        self._sql = sql
+        self.calls = 0
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls += 1
+        self.seen = user_prompt
+        return json.dumps({"sql": self._sql, "explanation": "fixed", "confidence": "high"})
+
+
+def test_sql_that_compiles_is_left_alone():
+    report = _banking_report()
+    result = AskResult(sql="SELECT 1 FROM CUSTOMERS")
+    model = _Model("never used")
+    out = repair_invalid_sql(
+        "q", result, report, provider=model, check=lambda _sql: None
+    )
+    assert out is result
+    assert model.calls == 0  # no second model call when there is nothing to fix
+
+
+def test_a_rejected_query_is_repaired_and_the_error_is_shown():
+    report = _banking_report()
+    broken = "SELECT c.ID FROM CUSTOMERS c WHERE SUM(c.AMT) > 10"
+    fixed = "SELECT c.ID FROM CUSTOMERS c GROUP BY c.ID HAVING SUM(c.AMT) > 10"
+    errors = {broken: "ORA-00934: group function is not allowed here"}
+    model = _Model(fixed)
+    out = repair_invalid_sql(
+        "raport", AskResult(sql=broken), report,
+        provider=model, check=lambda sql: errors.get(sql),
+    )
+    assert out.sql == fixed
+    assert model.calls == 1
+    assert any("ORA-00934" in w for w in out.warnings)
+    assert "ORA-00934" in model.seen  # the model was told what Oracle actually said
+
+
+def test_an_unrepairable_query_keeps_the_original_and_warns():
+    report = _banking_report()
+    broken = "SELECT nope FROM CUSTOMERS"
+    attempt = "SELECT still_nope FROM CUSTOMERS"
+    errors = {
+        broken: 'ORA-00904: "NOPE": invalid identifier',
+        attempt: 'ORA-00904: "STILL_NOPE": invalid identifier',
+    }
+    model = _Model(attempt)
+    out = repair_invalid_sql(
+        "q", AskResult(sql=broken), report, provider=model, check=lambda sql: errors.get(sql),
+    )
+    assert out.sql == broken  # the analyst sees the query they can fix, not a different one
+    assert any("needs a human eye" in w for w in out.warnings)
+    # The warning must describe the query on screen, not the discarded repair attempt.
+    warning = " ".join(out.warnings)
+    assert "NOPE" in warning and "STILL_NOPE" not in warning
+
+
+def test_two_sibling_details_in_one_aggregate_are_flagged():
+    report = _banking_report()
+    sql = (
+        "SELECT c.ID, SUM(f.AMOUNT), COUNT(a.ALERT_ID) FROM CUSTOMERS c "
+        "JOIN FEE_CHARGE f ON f.X_ID = c.ID JOIN AML_ALERT a ON a.X_ID = c.ID GROUP BY c.ID"
+    )
+    out = warn_on_fan_out(AskResult(sql=sql), report)
+    assert len(out.warnings) == 1
+    assert "FEE_CHARGE" in out.warnings[0] and "AML_ALERT" in out.warnings[0]
+
+
+def test_a_parent_child_grandchild_chain_is_not_a_fan_out():
+    report = _banking_report()
+    sql = (
+        "SELECT c.ID, SUM(a.DAYS) FROM CUSTOMERS c JOIN LOANS l ON l.X_ID = c.ID "
+        "JOIN LOAN_ARREARS a ON a.X_ID = l.ID GROUP BY c.ID"
+    )
+    assert warn_on_fan_out(AskResult(sql=sql), report).warnings == []
+
+
+def test_no_aggregate_means_no_fan_out_warning():
+    report = _banking_report()
+    sql = (
+        "SELECT c.ID, f.AMOUNT, a.ALERT_ID FROM CUSTOMERS c JOIN FEE_CHARGE f ON f.X_ID = c.ID "
+        "JOIN AML_ALERT a ON a.X_ID = c.ID"
+    )
+    assert warn_on_fan_out(AskResult(sql=sql), report).warnings == []
+
+
+def test_invalid_identifier_is_answered_with_the_maps_own_facts():
+    # Oracle says which column it could not resolve, never which table lacked it. The repair
+    # prompt must supply that: where the column really lives, and what the used tables hold.
+    report = _banking_report()
+    report.schema_info.tables = [
+        TableInfo(
+            name="CUSTOMERS", owner="B",
+            columns=[ColumnInfo(name="CUSTOMER_ID", data_type="NUMBER")],
+        ),
+        TableInfo(
+            name="FEE_CHARGE", owner="B",
+            columns=[ColumnInfo(name="FEE_ID", data_type="NUMBER"),
+                ColumnInfo(name="ACCOUNT_ID", data_type="NUMBER"),],
+        ),
+    ]
+    facts = column_facts_for_error(
+        'ORA-00904: "CUSTOMER_ID": invalid identifier',
+        "SELECT CUSTOMER_ID FROM FEE_CHARGE GROUP BY CUSTOMER_ID",
+        report,
+    )
+    assert "CUSTOMER_ID is a column of: CUSTOMERS" in facts
+    assert "FEE_CHARGE has exactly these columns: FEE_ID, ACCOUNT_ID" in facts
+    # Only tables the query names are described — the map may hold hundreds more.
+    assert "CUSTOMERS has exactly these columns" not in facts
+
+
+def test_column_facts_stay_silent_on_other_errors():
+    facts = column_facts_for_error(
+        "ORA-00934: group function is not allowed here", "SELECT 1", _banking_report()
+    )
+    assert facts == ""

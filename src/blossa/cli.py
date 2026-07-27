@@ -59,7 +59,9 @@ from .nlquery import (
     expand_count_to_list,
     parse_ask_response,
     privilege_hint,
+    repair_invalid_sql,
     validate_read_only_select,
+    warn_on_fan_out,
     with_row_limit,
 )
 from .pipeline import run_scan_over_schema, scan_oracle
@@ -233,9 +235,31 @@ def _require_ask_provider(settings: Settings):
     return get_provider(settings.llm)
 
 
+def _compile_check(settings: Settings, sql: str) -> str | None:
+    """Ask Oracle whether this SELECT compiles. None means it does — or that we could not ask.
+
+    A database we cannot reach proves nothing about the query. Reporting an unreachable database
+    as a broken query would send the model off repairing SQL that was never wrong, so a failure to
+    CONNECT is silence; only a failure to PARSE is a verdict.
+    """
+    try:
+        db = Database(settings.oracle).connect()
+    except Exception:  # noqa: BLE001 - offline is not a verdict on the SQL
+        return None
+    try:
+        db.parse(sql)
+    except Exception as exc:  # noqa: BLE001 - the ORA- text is the useful part
+        return str(exc).strip().splitlines()[0]
+    finally:
+        db.close()
+    return None
+
+
 def _print_proposal(result: AskResult) -> None:
     console.print()
     console.print(Syntax(result.sql, "sql", theme="ansi_dark", word_wrap=True))
+    for warning in result.warnings:
+        err.print(f"[yellow]![/yellow] {warning}")
     if result.explanation:
         console.print(f"[dim]{result.explanation}[/dim]")
     if result.assumptions:
@@ -341,6 +365,22 @@ def _answer_ask_turn(
         result = parse_ask_response(raw)
         result = enforce_error_severity_filter(question, result, report)
         result = expand_count_to_list(question, result)
+        # Let Oracle parse it before it is printed. A query that cannot compile is not an answer,
+        # and the model fixes a named error far more reliably than it avoids one. --dry-run asked
+        # for the database to be left alone, and a parse still opens a connection, so it is skipped.
+        if not dry_run:
+            _status("Checking the query against the database ...")
+            result = repair_invalid_sql(
+                question,
+                result,
+                report,
+                provider=provider,
+                check=lambda sql: _compile_check(settings, sql),
+                use_dba=settings.oracle.use_dba_catalog,
+            )
+        # Compiling is not the same as being right: summing across two detail tables runs fine and
+        # returns inflated numbers. Oracle cannot object to that; we can.
+        result = warn_on_fan_out(result, report)
 
     if not result.answerable:
         # No SQL: either a plain-language answer (e.g. "what does this procedure do") drawn from

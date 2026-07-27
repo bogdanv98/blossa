@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
@@ -54,6 +55,9 @@ class AskResult(BaseModel):
     explanation: str = ""
     assumptions: list[str] = Field(default_factory=list)
     confidence: ConfidenceLevel = ConfidenceLevel.LOW
+    # Problems Blossa found in the query itself — a compile error Oracle would raise, a join that
+    # will double-count. Assumptions are what the model chose; warnings are what it got wrong.
+    warnings: list[str] = Field(default_factory=list)
 
     @property
     def answerable(self) -> bool:
@@ -107,6 +111,19 @@ ASK_SYSTEM_PROMPT = (
     "When the question is unrelated to the conversation, ignore the prior SQL and answer fresh.\n"
     "- Produce exactly ONE statement: a SELECT (a leading WITH ... SELECT is fine). NEVER write "
     "INSERT, UPDATE, DELETE, MERGE or any DDL.\n"
+    "- NEVER aggregate over two detail tables that hang off the SAME parent in one query. Joining "
+    "customer->fees and customer->alerts together pairs every fee with every alert, and each SUM "
+    "and COUNT comes back multiplied. The query runs and the numbers are silently wrong. Instead "
+    "aggregate each detail in its OWN subquery grouped by the parent key, then join those "
+    "subqueries: WITH fees AS (SELECT customer_id, SUM(amount) amt FROM fee_charge GROUP BY "
+    "customer_id), alerts AS (SELECT customer_id, COUNT(*) n FROM aml_alert GROUP BY customer_id) "
+    "SELECT ... FROM customers c LEFT JOIN fees f ON ... LEFT JOIN alerts a ON ...\n"
+    "- An aggregate belongs in HAVING, never in WHERE. A table alias can only be used in or after "
+    "the join that defines it. Both are errors Oracle rejects outright.\n"
+    "- Before you GROUP BY or join on a key, CHECK the map that the table actually has that "
+    "column. A detail table often does not carry the parent key directly — a fee may hang off an "
+    "account and reach the customer only through it. Follow the relationships in the map; never "
+    "assume a column exists because it would be convenient.\n"
     "- For questions about the DATA, use ONLY tables and columns from the map. Qualify columns "
     "when ambiguous, use the listed relationships for joins, and reference tables by the names "
     "shown in the map (owner-qualified when the name contains a dot).\n"
@@ -500,6 +517,227 @@ def with_row_limit(sql: str, max_rows: int) -> str:
     """Wrap a validated SELECT so at most `max_rows` rows come back (Oracle ROWNUM, order-safe)."""
     n = max(1, int(max_rows))
     return f"SELECT * FROM (\n{sql}\n) WHERE ROWNUM <= {n}"
+
+
+# ------------------------------------------------- compile-check and repair
+
+# A generated query can name every table correctly and still not be a query: a group function in
+# WHERE, an alias used one join before it is defined, a column that belongs to the other table.
+# Oracle knows all of this the moment it parses the statement, and parsing costs nothing and
+# touches no rows — so ask it, and hand the model back its own SQL together with the real error.
+#
+# One repair round, not a loop. A second failure means the model does not know how to fix it, and
+# spending another minute of a local model's time to find that out helps nobody; the query is
+# returned with the error attached so the person reading it can decide.
+
+REPAIR_SYSTEM_PROMPT = (
+    "You fix Oracle SQL that failed to compile.\n"
+    "You are given the business question, the SQL you produced for it, and Oracle's own error.\n"
+    "Return the SAME query with the error fixed — do not answer a different question, do not "
+    "simplify the report by dropping columns the question asked for.\n"
+    "Common causes: an aggregate used in WHERE (it belongs in HAVING), a table alias referenced "
+    "before the join that defines it, a column taken from the wrong table, a function given the "
+    "wrong argument type.\n"
+    "Reply with JSON only: {\"sql\": ..., \"explanation\": ..., \"assumptions\": [...], "
+    '"confidence": "high"|"medium"|"low"}.'
+)
+
+
+def build_repair_prompt(
+    question: str,
+    sql: str,
+    error: str,
+    report: ScanReport,
+    *,
+    use_dba: bool = False,
+) -> str:
+    context = json.dumps(build_schema_context(report), indent=2, default=str)
+    language = (
+        "Romanian (romana)" if _looks_romanian(question) else "the same language as the question"
+    )
+    facts = column_facts_for_error(error, sql, report)
+    facts_block = f"What the map says about it:\n{facts}\n\n" if facts else ""
+    return (
+        f"Database map (semantic, PII-safe JSON):\n{context}\n\n"
+        f"Catalog views (for questions about the database itself):\n"
+        f"{catalog_reference(use_dba)}\n\n"
+        f"Business question:\n{question.strip()}\n\n"
+        f"The SQL that failed:\n{sql.strip()}\n\n"
+        f"Oracle rejected it with:\n{error.strip()}\n\n"
+        f"{facts_block}"
+        f"Write \"explanation\" and \"assumptions\" in {language}. Return the corrected SQL.\n\n"
+        f"{_ASK_OUTPUT_CONTRACT}"
+    )
+
+
+# Oracle writes the offender as "COL" or as "ALIAS"."COL". The alias half is optional and must be
+# anchored on its dot — without that anchor a greedy match eats the column name and leaves its last
+# letter behind.
+_INVALID_IDENTIFIER = re.compile(
+    r'ORA-00904:\s*(?:"?[A-Za-z_$#][\w$#]*"?\s*\.\s*)?"?([A-Za-z_$#][\w$#]*)"?\s*:'
+    r"\s*invalid identifier",
+    re.IGNORECASE,
+)
+
+
+def column_facts_for_error(error: str, sql: str, report: ScanReport) -> str:
+    """Turn "invalid identifier" into the facts the model needs to fix it.
+
+    Oracle names the column it could not resolve but never says which table was missing it, so a
+    model reading the error alone has no way to tell whether it picked the wrong table or the
+    wrong name. The map knows both. State where the column really lives, and list the columns of
+    every table the query touches — grounding beats guessing, and this costs no model call.
+    """
+    match = _INVALID_IDENTIFIER.search(error)
+    if not match:
+        return ""
+    wanted = match.group(1).upper()
+    used = referenced_tables(sql)
+    lines: list[str] = []
+    homes = [
+        t.name for t in report.schema_info.tables
+        if any(c.name.upper() == wanted for c in t.columns)
+    ]
+    if homes:
+        where = ", ".join(sorted(homes))
+        lines.append(f"{wanted} is a column of: {where} — and of no other table.")
+    else:
+        lines.append(f"No table in this schema has a column called {wanted}.")
+    for table in report.schema_info.tables:
+        if table.name.upper() in used:
+            cols = ", ".join(c.name for c in table.columns)
+            lines.append(f"{table.name} has exactly these columns: {cols}")
+    joins = [
+        f"{r.from_table}.{'+'.join(r.from_columns)} -> {r.to_table}.{'+'.join(r.to_columns)}"
+        for r in report.relationships
+        if r.from_table.upper() in used or r.to_table.upper() in used
+    ]
+    if joins:
+        lines.append(
+            "Reach a table that lacks the column through these relationships: " + "; ".join(joins)
+        )
+    return "\n".join(lines)
+
+
+def sql_compile_error(check: Callable[[str], str | None], sql: str) -> str | None:
+    """Return Oracle's complaint about this SQL, or None when it compiles.
+
+    `check` is the caller's parse function — a live Database.parse in production, a fake in
+    tests. SQL that is not a read-only SELECT never reaches the database at all.
+    """
+    if not sql.strip():
+        return None
+    try:
+        safe = validate_read_only_select(sql)
+    except UnsafeQueryError as exc:
+        return str(exc)
+    return check(safe)
+
+
+def repair_invalid_sql(
+    question: str,
+    result: AskResult,
+    report: ScanReport,
+    *,
+    provider: object,
+    check: Callable[[str], str | None],
+    use_dba: bool = False,
+) -> AskResult:
+    """Compile-check the proposed SQL and, if Oracle rejects it, let the model fix it once.
+
+    Returns the repaired result when the second attempt compiles. When it still does not, the
+    ORIGINAL query comes back with the error as a warning — a broken query the reader can see
+    and correct beats a silently different one they cannot.
+    """
+    error = sql_compile_error(check, result.sql)
+    if error is None:
+        return result
+    generate = getattr(provider, "generate", None)
+    if generate is None:
+        return result.model_copy(update={"warnings": [*result.warnings, _repair_note(error)]})
+    prompt = build_repair_prompt(question, result.sql, error, report, use_dba=use_dba)
+    try:
+        repaired = parse_ask_response(generate(REPAIR_SYSTEM_PROMPT, prompt))
+    except Exception:  # noqa: BLE001 - a failed repair must not lose the original answer
+        return result.model_copy(update={"warnings": [*result.warnings, _repair_note(error)]})
+    still_broken = sql_compile_error(check, repaired.sql)
+    if still_broken is not None or not repaired.sql.strip():
+        # Report what is wrong with the query being SHOWN — the original. The repair attempt's own
+        # error belongs to SQL nobody will ever see, and quoting it sends the reader hunting for a
+        # column that does not appear anywhere on their screen.
+        return result.model_copy(update={"warnings": [*result.warnings, _repair_note(error)]})
+    note = f"The first query did not compile ({error.strip()}); this is the corrected version."
+    return repaired.model_copy(update={"warnings": [*repaired.warnings, note]})
+
+
+# ------------------------------------------------------- fan-out double counting
+
+# The defect Oracle cannot catch. Join a parent to TWO independent child tables and aggregate,
+# and every child row on one side is repeated once per row on the other: SUM comes back multiplied,
+# COUNT comes back wrong, and the query runs perfectly. A report that is silently 4x too high is
+# worse than one that fails. Nothing in a prompt reliably prevents this, so detect it and say so —
+# the same lesson as the severity filter: for an invariant that must hold, add a check, not a rule.
+
+_AGGREGATES = re.compile(r"\b(SUM|COUNT|AVG)\s*\(", re.IGNORECASE)
+_REFERENCED_TABLE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_$#][\w$#]*(?:\.[A-Za-z_$#][\w$#]*)?)",
+    re.IGNORECASE,
+)
+
+
+def referenced_tables(sql: str) -> set[str]:
+    """Bare, upper-cased table names appearing after FROM or JOIN."""
+    return {m.group(1).split(".")[-1].upper() for m in _REFERENCED_TABLE.finditer(sql)}
+
+
+def fan_out_parents(sql: str, report: ScanReport) -> dict[str, list[str]]:
+    """Parents joined to two or more of their OWN children in this query.
+
+    A chain (customer -> loan -> arrears) is harmless: each step narrows to one path. Two
+    children of the same parent are not — customer -> fees AND customer -> alerts pairs every
+    fee with every alert, and any SUM over that is multiplied by the other side's row count.
+    """
+    present = referenced_tables(sql)
+    branches: dict[str, list[str]] = {}
+    for rel in report.relationships:
+        child, parent = rel.from_table.upper(), rel.to_table.upper()
+        if child == parent or child not in present or parent not in present:
+            continue
+        kids = branches.setdefault(parent, [])
+        if child not in kids:
+            kids.append(child)
+    return {parent: kids for parent, kids in branches.items() if len(kids) > 1}
+
+
+def warn_on_fan_out(result: AskResult, report: ScanReport) -> AskResult:
+    """Flag an aggregate that spans two sibling detail tables in one query.
+
+    It reports; it never rewrites. The fix — aggregate each detail on its own, then join the
+    results — changes the shape of the report, and that is the analyst's call, not ours.
+    """
+    sql = result.sql
+    if not sql.strip() or not _AGGREGATES.search(sql):
+        return result
+    if re.search(r"^\s*WITH\b", sql, re.IGNORECASE):
+        return result  # already factored into per-detail subqueries; not our case to judge
+    branches = fan_out_parents(sql, report)
+    if not branches:
+        return result
+    detail = "; ".join(f"{parent} -> {' + '.join(kids)}" for parent, kids in branches.items())
+    note = (
+        f"This query aggregates across sibling detail tables ({detail}). Every row on one branch "
+        "is repeated for each row on the other, so SUM, COUNT and AVG will come back larger than "
+        "the truth — the query will run and the numbers will be wrong. Aggregate each detail "
+        "table separately, then join those results."
+    )
+    return result.model_copy(update={"warnings": [*result.warnings, note]})
+
+
+def _repair_note(error: str) -> str:
+    return (
+        f"Oracle will not run this query: {error.strip()} "
+        "An automatic fix was attempted and did not succeed — the query needs a human eye."
+    )
 
 
 # --------------------------------------------------- program lookup safety net

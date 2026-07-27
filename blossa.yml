@@ -26,8 +26,13 @@ llm:
   ollama:
     base_url: "http://localhost:11434"
     model: "qwen2.5:14b"
-    # Hard timeout per request (seconds).
-    timeout: 120
+    # Hard timeout per request (seconds). Asking a question sends the whole schema map, so a
+    # local model can take minutes on a large map — scanning is per-table and much quicker.
+    timeout: 300
+    # Ollama silently truncates a prompt that does not fit its context window, dropping the
+    # schema map and leaving the model to invent tables. Blossa sizes the window per request;
+    # this caps it. Raise for very large maps, lower on a memory-tight machine.
+    max_context_tokens: 32768
   openai_compatible:
     base_url: "http://localhost:8000/v1"
     model: "local-model"

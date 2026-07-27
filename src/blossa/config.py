@@ -50,7 +50,18 @@ class OracleConfig(BaseModel):
 class OllamaConfig(BaseModel):
     base_url: str = "http://localhost:11434"
     model: str = "qwen2.5:14b"
-    timeout: int = 120
+    # A question asked against a full schema map is a large prompt, and a local model reads it at
+    # its own pace: ~150s for a 17-table map on a 14B model. 120s used to be enough only because
+    # the prompt was being truncated before the model ever saw most of it.
+    timeout: int = 300
+    # Ollama TRUNCATES a prompt that does not fit the context window, silently and from the front —
+    # where the system rules and the schema map live. Its default window is 2048 tokens, far below
+    # what a map of a real schema needs, so the window is sized per request instead (see
+    # llm/http_provider.context_window_for). This caps that sizing: raise it for very large maps,
+    # lower it if the machine is short on memory. Every extra token of window costs KV cache.
+    max_context_tokens: int = 32768
+    # Pin a fixed window instead of sizing per request. Leave None unless you have a reason.
+    num_ctx: int | None = None
 
 
 class OpenAICompatibleConfig(BaseModel):

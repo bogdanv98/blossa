@@ -12,7 +12,9 @@ llm:
   ollama:
     base_url: "http://localhost:11434"
     model: "qwen2.5:14b"
-    timeout: 120
+    # This map is 17 tables; asking a question against it is a ~12k-token prompt, which a local
+    # 14B model takes a couple of minutes to read. Scanning is per-table and much faster.
+    timeout: 600
 
 output:
   dir: "samples/out"

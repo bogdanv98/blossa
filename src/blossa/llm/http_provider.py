@@ -9,11 +9,41 @@ base_url you configure. With Ollama on localhost, Blossa makes no off-box networ
 
 from __future__ import annotations
 
+import warnings
+
 import httpx
 
 from ..config import OllamaConfig, OpenAICompatibleConfig
 from ..models import TableSemantics, TableSummary
 from .base import SYSTEM_PROMPT, LLMProvider, build_user_prompt, parse_response
+
+# Ollama discards whatever does not fit the context window and reports nothing — no error, no
+# flag on the response. The system rules and the schema map sit at the FRONT of the prompt, so a
+# window that is too small removes exactly the grounding the answer depends on, and the model
+# then answers about a plausible invented schema instead of the real one. The default window is
+# 2048 tokens; a map of a 17-table schema needs roughly six times that. So ask for a window that
+# fits the prompt we are actually sending.
+#
+# Measured on qwen2.5:14b, prompts of this shape (JSON, Oracle identifiers, English + Romanian
+# prose) run about 4.1 characters per token. Dividing by 3.5 overestimates the token count on
+# purpose: guessing high costs a little KV cache, guessing low costs the whole schema map.
+_CHARS_PER_TOKEN = 3.5
+_RESPONSE_HEADROOM = 1024  # the reply shares the window with the prompt
+_MIN_CONTEXT = 4096  # below this, small prompts pay for a window sizing they never use
+
+
+def context_window_for(prompt_chars: int, cap: int = 32768) -> tuple[int, int]:
+    """Pick a context window for a prompt of this size.
+
+    Returns (window, needed): the window to request, and the tokens the prompt is estimated to
+    need. When needed > window the prompt will be truncated — the caller warns rather than
+    letting it happen quietly.
+    """
+    needed = int(prompt_chars / _CHARS_PER_TOKEN) + _RESPONSE_HEADROOM
+    window = _MIN_CONTEXT
+    while window < needed:
+        window *= 2
+    return min(window, cap), needed
 
 
 class OllamaProvider(LLMProvider):
@@ -31,12 +61,30 @@ class OllamaProvider(LLMProvider):
         except httpx.HTTPError:
             return False
 
+    def _num_ctx(self, prompt_chars: int) -> int:
+        cap = self._config.max_context_tokens
+        window, needed = context_window_for(prompt_chars, cap)
+        if self._config.num_ctx:
+            window = self._config.num_ctx
+        if needed > window:
+            warnings.warn(
+                f"This prompt needs about {needed} tokens but the context window is {window}. "
+                f"Ollama will truncate it from the front, dropping part of the schema map, and "
+                f"the answer may reference tables that do not exist. Raise "
+                f"llm.ollama.max_context_tokens (currently {cap}) or scan fewer schemas at once.",
+                stacklevel=3,
+            )
+        return window
+
     def _post_chat(self, system_prompt: str, user_prompt: str) -> str:
         body = {
             "model": self._config.model,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": 0,
+                "num_ctx": self._num_ctx(len(system_prompt) + len(user_prompt)),
+            },
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

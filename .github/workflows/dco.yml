@@ -1,0 +1,37 @@
+name: DCO
+
+# The CLA (CLA.md) is accepted by signing off each commit. That promise is what keeps a future
+# commercial license possible, so it is checked here rather than left to review discipline.
+on:
+  pull_request:
+
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit carries a matching Signed-off-by
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          # Merge commits are skipped: they carry no authorship of their own.
+          for sha in $(git rev-list --no-merges "$BASE".."$HEAD"); do
+            author="$(git show -s --format='%an <%ae>' "$sha")"
+            if git show -s --format='%B' "$sha" | grep -qiF "Signed-off-by: $author"; then
+              continue
+            fi
+            echo "::error::$(git show -s --format='%h %s' "$sha") — no 'Signed-off-by: $author'"
+            missing=1
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo
+            echo "Sign off every commit with 'git commit -s' (or 'git rebase --signoff $BASE' to fix"
+            echo "a branch you already wrote). The sign-off is how you accept the CLA — see"
+            echo "CONTRIBUTING.md and CLA.md."
+            exit 1
+          fi
+          echo "All commits signed off."

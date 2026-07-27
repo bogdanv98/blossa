@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """The summary handed to the LLM must never contain raw row values — only PII-safe artifacts."""
 
 import json

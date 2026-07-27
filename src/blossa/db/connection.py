@@ -57,6 +57,19 @@ class Database:
             columns = [d[0] for d in cur.description]
             return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
+    def parse(self, sql: str) -> None:
+        """Have Oracle compile a statement without running it.
+
+        Raises the real ORA- error when the statement does not compile: an unknown column, an
+        alias used before its join, a group function in a WHERE clause. A parse fetches nothing
+        and changes nothing, so this stays well inside the read-only boundary — it is the
+        cheapest way to find out whether generated SQL is real before anyone sees its results.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database.connect() must be called before parse().")
+        with self._conn.cursor() as cur:
+            cur.parse(sql)
+
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()

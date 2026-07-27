@@ -72,7 +72,9 @@ from ..nlquery import (
     expand_count_to_list,
     parse_ask_response,
     privilege_hint,
+    repair_invalid_sql,
     validate_read_only_select,
+    warn_on_fan_out,
     with_row_limit,
 )
 from ..program import declared_subprograms
@@ -368,6 +370,28 @@ def create_app(
             state["provider"] = get_provider(settings.llm)
         return state["provider"]
 
+    def _compile_check(sql: str) -> str | None:
+        """Ask Oracle whether this SELECT compiles. None means it does — or that we could not ask.
+
+        A database we cannot reach proves nothing about the query, so a failure to CONNECT is
+        silence; only a failure to PARSE is a verdict.
+        """
+        try:
+            db = make_db()
+            parse = getattr(db, "parse", None)
+            if parse is None:  # an injected fake without parse support
+                return None
+            connected = db.__enter__()
+        except Exception:  # noqa: BLE001 - offline is not a verdict on the SQL
+            return None
+        try:
+            connected.parse(sql)
+        except Exception as exc:  # noqa: BLE001 - the ORA- text is the useful part
+            return str(exc).strip().splitlines()[0]
+        finally:
+            db.__exit__(None, None, None)
+        return None
+
     # The map is immutable for the lifetime of the server, and at scale the view is expensive to
     # rebuild AND to re-serialize (4000 tables -> ~4 MB, ~3 s per request). Both are paid once.
     map_json_cache: dict[str, str] = {}
@@ -418,6 +442,19 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"The model call failed: {exc}") from exc
         result = enforce_error_severity_filter(question, parse_ask_response(raw), report)
         result = expand_count_to_list(question, result)
+        # Oracle parses the query before anyone is shown it. A query that cannot compile is not an
+        # answer, and the model is far better at fixing a named error than at avoiding it.
+        result = repair_invalid_sql(
+            question,
+            result,
+            report,
+            provider=prov,
+            check=_compile_check,
+            use_dba=settings.oracle.use_dba_catalog,
+        )
+        # Compiling is not the same as being right: a query that joins two detail tables and sums
+        # them runs perfectly and returns inflated numbers. Oracle cannot object; we can.
+        result = warn_on_fan_out(result, report)
         return {"kind": "sql", **result.model_dump()}
 
     @app.post("/api/run")

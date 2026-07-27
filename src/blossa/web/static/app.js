@@ -174,6 +174,12 @@ function showAnswer(data) {
   const ul = $("#assumptions");
   ul.replaceChildren();
   (data.assumptions || []).forEach((a) => ul.append(el("li", { text: a })));
+  // Warnings are not assumptions: these are defects Blossa found in the query it is showing you.
+  const warn = $("#ask-warnings");
+  warn.replaceChildren();
+  (data.warnings || []).forEach((w) =>
+    warn.append(el("p", { class: "notice warn", text: w })),
+  );
   $("#results").replaceChildren();
   setStatus("#run-status", "");
 }

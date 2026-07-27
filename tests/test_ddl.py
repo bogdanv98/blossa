@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """DDL retrieval: the DBMS_METADATA plumbing and the offline CREATE TABLE reconstruction."""
 
 from datetime import datetime

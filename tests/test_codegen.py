@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """Code generation: intent detection, grounding, the destructive-statement review, parsing.
 
 The safety property under test throughout: Blossa writes code, it never runs it.

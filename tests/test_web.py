@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """Web API endpoints (/api/map, /api/ask, /api/run), exercised with FastAPI's TestClient.
 
 A fake provider and a fake DB are injected so the endpoints run without a live model or Oracle.

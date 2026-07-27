@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from blossa.checks import run_checks
 from blossa.demo import build_demo_schema
 from blossa.models import (

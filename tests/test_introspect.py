@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """Introspection assembly logic, exercised with a fake QueryExecutor (no Oracle needed)."""
 
 from blossa.db.introspect import introspect_schema, list_non_system_schemas

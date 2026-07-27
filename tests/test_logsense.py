@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 """Log-content analysis: redaction, deterministic SQL builders, the local-provider gate, parsing."""
 
 from blossa.logsense import (

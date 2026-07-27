@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Bogdan Voinea
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from blossa.config import Settings
 from blossa.diagnostics import (
     Status,

@@ -23,6 +23,11 @@ llm:
   # next scan; an existing map keeps the language it was written in. `ask` is separate — it
   # replies in whatever language the question was asked in.
   language: "en"
+  # How many tables of the map one question may carry. Blossa sends only the tables a question
+  # scores against, plus one join hop, and names the rest so the model can ask for them instead
+  # of inventing their columns. A map smaller than this is sent whole. Raise it for a larger
+  # model, lower it if answers wander to the wrong table.
+  max_map_tables: 12
   ollama:
     base_url: "http://localhost:11434"
     model: "qwen2.5:14b"

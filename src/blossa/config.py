@@ -78,6 +78,13 @@ class LLMConfig(BaseModel):
     # translated. Changing this only affects a NEW scan — existing maps keep the language they
     # were written in. The offline heuristic provider always writes English.
     language: str = "en"
+    # How many tables of the map one question may carry. The whole map used to go into every
+    # `ask` prompt, which caps accuracy (the answer drowns in tables the question never mentions),
+    # caps speed (a bigger window leaves less VRAM for the model itself), and simply does not fit
+    # on a real schema of thousands of tables. Blossa now sends only the tables the question scores
+    # against, plus one join hop — see relevance.select_map_slice. Raise it for a larger model,
+    # lower it if answers wander to the wrong table. A map smaller than this is sent whole.
+    max_map_tables: int = 12
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     openai_compatible: OpenAICompatibleConfig = Field(default_factory=OpenAICompatibleConfig)
 

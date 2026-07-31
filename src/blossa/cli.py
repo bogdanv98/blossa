@@ -354,7 +354,11 @@ def _answer_ask_turn(
         _status("Translating your question to SQL ...")
         try:
             prompt = build_ask_prompt(
-                question, report, use_dba=settings.oracle.use_dba_catalog, history=history
+                question,
+                report,
+                use_dba=settings.oracle.use_dba_catalog,
+                history=history,
+                max_tables=settings.llm.max_map_tables,
             )
             raw = provider.generate(ASK_SYSTEM_PROMPT, prompt)
         except Exception as exc:  # noqa: BLE001
@@ -377,6 +381,7 @@ def _answer_ask_turn(
                 provider=provider,
                 check=lambda sql: _compile_check(settings, sql),
                 use_dba=settings.oracle.use_dba_catalog,
+                max_tables=settings.llm.max_map_tables,
             )
         # Compiling is not the same as being right: summing across two detail tables runs fine and
         # returns inflated numbers. Oracle cannot object to that; we can.

@@ -265,6 +265,9 @@ class MapSlice:
     tables: list[str] = field(default_factory=list)  # table_key(), most relevant first
     programs: list[str] = field(default_factory=list)  # table_key()-style program keys
     log_tables: list[str] = field(default_factory=list)
+    # Tables that are here only because they are one join hop from a wanted one. They are needed
+    # for their KEYS, not for their prose, and are rendered without column meanings.
+    context_tables: list[str] = field(default_factory=list)
     omitted_tables: list[str] = field(default_factory=list)  # display names, capped
     omitted_table_count: int = 0
     omitted_program_count: int = 0
@@ -278,6 +281,10 @@ class MapSlice:
 
     def keeps_log_table(self, owner: str | None, name: str) -> bool:
         return table_key(owner, name) in set(self.log_tables)
+
+    def is_context_only(self, owner: str | None, name: str) -> bool:
+        """True for a table kept only to carry a join — worth its keys, not its prose."""
+        return table_key(owner, name) in set(self.context_tables)
 
     # Built on demand rather than stored: the dataclass is frozen and these are pure views of it.
     @property
@@ -385,7 +392,7 @@ def select_map_slice(
         degree[dst] += 1
 
     order = {key: i for i, key in enumerate(keys)}
-    kept = _rank(keys, scores, edges, degree, order, max_tables)
+    kept, context = _rank(keys, scores, edges, degree, order, max_tables)
     kept_set = set(kept)
 
     omitted = [t.name for t, k in zip(tables, keys, strict=True) if k not in kept_set]
@@ -403,6 +410,7 @@ def select_map_slice(
         tables=sorted(kept, key=lambda k: order[k]),
         programs=programs,
         log_tables=log_tables,
+        context_tables=context,
         omitted_tables=omitted[:MAX_OMITTED_NAMES],
         omitted_table_count=len(omitted),
         omitted_program_count=len(units) - len(programs),
@@ -417,8 +425,8 @@ def _rank(
     degree: dict[str, int],
     order: dict[str, int],
     max_tables: int,
-) -> list[str]:
-    """The tables to keep: the ones the question hit, then the joins that reach them.
+) -> tuple[list[str], list[str]]:
+    """The tables to keep, and which of them are there only to carry a join.
 
     `max_tables` is a CEILING, not a target. Filling every free slot with whatever scored next is
     how a question about accounts ends up carrying LOCATIONS: the neighbours of a neighbour are
@@ -431,7 +439,7 @@ def _rank(
         # Nothing in the question resembles this schema's vocabulary. The most connected tables are
         # the ones the schema is built around, so they are the best blind guess — and far better
         # than the first N in catalog order, which is alphabetical accident.
-        return sorted(keys, key=lambda k: (-degree[k], order[k]))[:max_tables]
+        return sorted(keys, key=lambda k: (-degree[k], order[k]))[:max_tables], []
     # A single shared column name ("STATUS", "CREATED_AT") makes almost every table in a schema
     # score SOMETHING, so scoring above zero is not relevance. The bar is absolute rather than
     # relative to the best table on purpose: a long question that names six things makes its top
@@ -458,11 +466,13 @@ def _rank(
         (k for k in keys if k not in seeds and hops[k] > 0),
         key=lambda k: (-hops[k], -scores[k], order[k]),
     )
+    context: list[str] = []
     for key in reachable:
         if len(kept) >= soft_limit:
             break
         kept.append(key)
-    return kept
+        context.append(key)
+    return kept, context
 
 
 def _select_programs(

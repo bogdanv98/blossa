@@ -33,7 +33,13 @@ from pydantic import BaseModel, Field
 from .logsense import ERROR_SEVERITIES
 from .models import ConfidenceLevel, LogRole, ProgramKind, ScanReport
 from .program import declared_subprograms, package_subprograms, routines_referencing
-from .relevance import DEFAULT_MAX_TABLES, MapSlice, select_map_slice
+from .relevance import (
+    DEFAULT_MAX_TABLES,
+    MapSlice,
+    question_tokens,
+    select_map_slice,
+    tokenize,
+)
 
 # Keywords that must never appear in a query we are about to run. The READ ONLY transaction on the
 # connection is the real backstop; this is defence-in-depth and gives a clearer error message.
@@ -316,6 +322,36 @@ def catalog_reference(use_dba: bool) -> str:
     return CATALOG_REFERENCE_FULL if use_dba else CATALOG_REFERENCE_SCOPED
 
 
+# The catalog reference is ~1.6k tokens of Oracle data-dictionary documentation, and it was going
+# into EVERY prompt — including "how many accounts per status", which will never read a dictionary
+# view. That is a fifth of the prompt spent on nothing, on every question.
+#
+# The gate is deliberately generous: leaving the reference out of a question that DOES need it is
+# how the model ends up inventing a view name (it once wrote DBA_SCHEDULER_STEPS, which does not
+# exist), whereas including it needlessly only costs tokens. So any word that hints at the
+# database's own furniture brings it back.
+# Note what is NOT here: "account". An Oracle account is catalog furniture, but a bank account is
+# the business, and the question that motivated this trim was "how many accounts per status".
+_CATALOG_WORDS = (
+    "schema schemas table tables view views procedure procedures function functions package "
+    "packages trigger triggers index indexes sequence sequences synonym synonyms user users "
+    "privilege privileges grant grants role roles tablespace tablespaces constraint constraints "
+    "column columns object objects job jobs chain chains scheduler catalog dictionary database "
+    "owner owners invalid compiled ddl metadata partition partitions "
+    # Romanian
+    "schema scheme tabel tabele coloana coloane vedere vederi procedura proceduri functie "
+    "functii pachet pachete declansator declansatoare indecsi secventa secvente utilizator "
+    "utilizatori drepturi privilegii rol roluri constrangere constrangeri obiect obiecte joburi "
+    "lant lanturi planificator baza bazei dictionar proprietar structura structuri"
+)
+_CATALOG_STEMS = tokenize(_CATALOG_WORDS)
+
+
+def question_needs_catalog(question: str) -> bool:
+    """Does this question ask about the DATABASE itself rather than the business data in it?"""
+    return bool(question_tokens(question) & _CATALOG_STEMS)
+
+
 _ASK_OUTPUT_CONTRACT = (
     "Respond with JSON of exactly this shape:\n"
     "{\n"
@@ -356,18 +392,25 @@ def build_schema_context(report: ScanReport, sl: MapSlice | None = None) -> dict
         if sl and not sl.keeps_table(table.owner, table.name):
             continue
         sem = report.semantics_for(table.name)
-        col_meaning = {c.column.upper(): c.meaning for c in sem.columns} if sem else {}
+        # A table that is only here to carry a join is worth its KEYS, not its prose: the model
+        # needs to know what to join it on, not what every one of its columns means.
+        joins_only = bool(sl and sl.is_context_only(table.owner, table.name))
+        col_meaning = (
+            {c.column.upper(): c.meaning for c in sem.columns} if sem and not joins_only else {}
+        )
         pk_cols = set(table.primary_key.columns) if table.primary_key else set()
         fk_cols = {c for fk in table.foreign_keys for c in fk.columns}
-        columns = [
-            {
+        columns = []
+        for col in table.columns:
+            entry = {
                 "name": col.name,
                 "type": col.type_signature,
                 "key": "PK" if col.name in pk_cols else ("FK" if col.name in fk_cols else ""),
-                "means": col_meaning.get(col.name.upper(), ""),
             }
-            for col in table.columns
-        ]
+            meaning = col_meaning.get(col.name.upper(), "")
+            if meaning or not joins_only:
+                entry["means"] = meaning
+            columns.append(entry)
         tables.append(
             {
                 "name": _qualified(table.name, table.owner, multi),
@@ -508,7 +551,12 @@ def build_ask_prompt(
     if sl is None:
         sl = map_slice_for(question, report, history=history, max_tables=max_tables)
     context = json.dumps(build_schema_context(report, sl), indent=2, default=str)
-    catalog = catalog_reference(use_dba)
+    catalog = (
+        f"Catalog views (for questions about the database itself):\n"
+        f"{catalog_reference(use_dba)}\n\n"
+        if question_needs_catalog(question)
+        else ""
+    )
     convo = ""
     if history:
         convo = (
@@ -524,7 +572,7 @@ def build_ask_prompt(
     )
     return (
         f"Database map (semantic, PII-safe JSON):\n{context}\n\n"
-        f"Catalog views (for questions about the database itself):\n{catalog}\n\n"
+        f"{catalog}"
         f"{convo}"
         f"Business question:\n{question.strip()}\n\n"
         f"Write \"explanation\" and \"assumptions\" in {language}. The SQL itself stays in "

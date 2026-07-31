@@ -169,6 +169,34 @@ def test_prompt_includes_question_and_output_contract():
     assert '"sql"' in prompt and '"confidence"' in prompt
 
 
+def test_catalog_reference_only_rides_along_when_the_question_is_about_the_database():
+    # ~1.6k tokens of data-dictionary documentation went into every prompt, including questions
+    # that will never read a dictionary view. The gate is generous on purpose: leaving it out of
+    # a question that needs it is how the model invents a view name.
+    report = _demo_report()
+    assert "ALL_TABLES" not in build_ask_prompt("how many customers are there?", report)
+    assert "ALL_TABLES" not in build_ask_prompt("cate conturi avem pe fiecare status?", report)
+    for catalog_question in (
+        "how many tables are there?",
+        "ce proceduri exista in baza?",
+        "which views do we have?",
+        "cati utilizatori are baza de date?",
+    ):
+        assert "ALL_TABLES" in build_ask_prompt(catalog_question, report), catalog_question
+
+
+def test_a_join_only_table_carries_its_keys_not_its_prose():
+    report = _demo_report()
+    sl = map_slice_for("how many order items per customer?", report, max_tables=4)
+    assert sl.context_tables  # reached by a join hop, not by the question's own words
+    ctx = build_schema_context(report, sl)
+    joined = {k.split(".")[-1] for k in sl.context_tables}
+    for table in ctx["tables"]:
+        if table["name"].split(".")[-1] in joined:
+            assert all(not c.get("means") for c in table["columns"])
+            assert any(c["key"] for c in table["columns"])  # the keys are still there
+
+
 def test_prompt_catalog_views_follow_scope():
     report = _demo_report()
     scoped = build_ask_prompt("how many schemas?", report, use_dba=False)

@@ -32,6 +32,7 @@ from blossa.nlquery import (
     catalog_reference,
     column_facts_for_error,
     expand_count_to_list,
+    map_slice_for,
     parse_ask_response,
     privilege_hint,
     repair_invalid_sql,
@@ -136,6 +137,30 @@ def test_context_has_tables_columns_meanings_and_relationships():
     email = next(c for c in customers["columns"] if c["name"] == "EMAIL")
     assert email["means"]  # the heuristic gave EMAIL a meaning, carried into the context
     assert ctx["relationships"]  # the demo schema has foreign keys
+
+
+def test_context_filtered_to_a_slice_says_so_and_names_what_is_missing():
+    # A prompt that carries only part of the map must SAY it is partial. Otherwise "not in the
+    # map" reads as "does not exist" — and an unseen table is exactly the one whose columns a
+    # model invents.
+    report = _demo_report()
+    sl = map_slice_for("how many customers are there?", report, max_tables=1)
+    ctx = build_schema_context(report, sl)
+    assert len(ctx["tables"]) == 1
+    assert "FILTERED" in ctx["note"] and "other_tables" in ctx
+    assert ctx["other_tables"]  # the cut tables are named, not silently dropped
+
+
+def test_context_drops_relationships_that_leave_the_slice():
+    # An edge to a table the model cannot see is a join it cannot write, and an invitation to
+    # reference columns it was never shown.
+    report = _demo_report()
+    sl = map_slice_for("how many customers are there?", report, max_tables=1)
+    ctx = build_schema_context(report, sl)
+    kept = {t["name"] for t in ctx["tables"]}
+    for rel in ctx["relationships"]:
+        src, dst = rel.split(" -> ")
+        assert src.split("(")[0] in kept and dst.split("(")[0] in kept
 
 
 def test_prompt_includes_question_and_output_contract():

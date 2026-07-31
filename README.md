@@ -176,6 +176,17 @@ can build on them) but **never any results**, so the no-raw-rows boundary holds 
 conversation. Type `reset` to start a fresh thread, blank/`exit` to quit. The same refine loop is in
 the web UI's **Ask** tab (with a _New thread_ button).
 
+**Only the relevant part of the map is sent.** A real schema has thousands of tables; shipping all
+of them with every question would not fit any context window, and even on a small schema it buries
+the answer in tables the question never mentions. So Blossa scores the map against the question —
+table names, purposes, column names and meanings, the tables the previous turn's query used, the
+tables a named procedure touches — expands **one join hop** so the path between two wanted tables
+(and the bridge in the middle) survives, and sends that slice. The tables left out are still listed
+**by name**, so the model can say _"I need ORDERS, which you didn't give me"_ rather than invent its
+columns. `llm.max_map_tables` (default 12) is the ceiling, not a target: a one-table question sends
+four tables, a six-table report sends twelve. On a 4000-table schema this is the difference between
+a ~1,000,000-token prompt and a ~3,000-token one.
+
 `ask` also answers questions about the **database itself** (how many schemas, which tables exist,
 row counts, columns, constraints) from Oracle's data dictionary — see _Access_ below for how the
 `scoped` vs `full` profile decides whether that covers just your schemas or the whole database.

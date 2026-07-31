@@ -434,7 +434,11 @@ def create_app(
             return {"kind": "sql", **known.model_dump()}
         prov = _ensure_provider()
         prompt = build_ask_prompt(
-            question, report, use_dba=settings.oracle.use_dba_catalog, history=body.history
+            question,
+            report,
+            use_dba=settings.oracle.use_dba_catalog,
+            history=body.history,
+            max_tables=settings.llm.max_map_tables,
         )
         try:
             raw = prov.generate(ASK_SYSTEM_PROMPT, prompt)
@@ -451,6 +455,7 @@ def create_app(
             provider=prov,
             check=_compile_check,
             use_dba=settings.oracle.use_dba_catalog,
+            max_tables=settings.llm.max_map_tables,
         )
         # Compiling is not the same as being right: a query that joins two detail tables and sums
         # them runs perfectly and returns inflated numbers. Oracle cannot object; we can.

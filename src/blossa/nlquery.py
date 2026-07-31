@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from .logsense import ERROR_SEVERITIES
 from .models import ConfidenceLevel, LogRole, ProgramKind, ScanReport
 from .program import declared_subprograms, package_subprograms, routines_referencing
+from .relevance import DEFAULT_MAX_TABLES, MapSlice, select_map_slice
 
 # Keywords that must never appear in a query we are about to run. The READ ONLY transaction on the
 # connection is the real backstop; this is defence-in-depth and gives a clearer error message.
@@ -341,14 +342,19 @@ def _qualified(table_name: str, owner: str | None, multi_schema: bool) -> str:
     return f"{owner}.{table_name}" if (multi_schema and owner) else table_name
 
 
-def build_schema_context(report: ScanReport) -> dict:
+def build_schema_context(report: ScanReport, sl: MapSlice | None = None) -> dict:
     """A compact, model-facing view of the map: tables + columns (with meaning) + relationships.
 
     No raw data — only structure and the inferred semantics already in the report.
+
+    `sl` narrows it to the part one question needs (see `relevance.select_map_slice`). Without a
+    slice the whole map is rendered, which is what every non-question caller wants.
     """
     multi = len(_distinct_owners(report)) > 1
     tables = []
     for table in report.schema_info.tables:
+        if sl and not sl.keeps_table(table.owner, table.name):
+            continue
         sem = report.semantics_for(table.name)
         col_meaning = {c.column.upper(): c.meaning for c in sem.columns} if sem else {}
         pk_cols = set(table.primary_key.columns) if table.primary_key else set()
@@ -372,6 +378,12 @@ def build_schema_context(report: ScanReport) -> dict:
 
     relationships = []
     for r in report.relationships:
+        # An edge to a table that is not in the slice is a join the model cannot write — and an
+        # invitation to reference columns it was never shown.
+        if sl and not (
+            sl.keeps_table(r.from_owner, r.from_table) and sl.keeps_table(r.to_owner, r.to_table)
+        ):
+            continue
         src = _qualified(r.from_table, r.from_owner, multi)
         dst = _qualified(r.to_table, r.to_owner, multi)
         kind = "declared" if r.declared else f"inferred ({r.confidence.value})"
@@ -391,6 +403,8 @@ def build_schema_context(report: ScanReport) -> dict:
     for unit in report.schema_info.program_units:
         key = (unit.owner, unit.name, unit.kind)
         seen_units.add(key)
+        if sl and not sl.keeps_program(unit.owner, unit.name):
+            continue
         sem = sem_by_unit.get(key)
         entry = {
             "name": _qualified(unit.name, unit.owner, multi),
@@ -423,15 +437,33 @@ def build_schema_context(report: ScanReport) -> dict:
             "columns": [{"name": c.column, "role": c.role.value} for c in lt.columns],
         }
         for lt in report.log_tables
+        if not sl or sl.keeps_log_table(lt.owner, lt.table)
     ]
 
-    return {
+    context = {
         "schema": report.schema_info.name,
         "tables": tables,
         "relationships": relationships,
         "programs": programs,
         "log_tables": log_tables,
     }
+    if sl and sl.trimmed:
+        # Say that this is a slice, and of what. Without it the model reads "not in the map" as
+        # "does not exist" — and a table it cannot see is exactly the one it would otherwise
+        # invent columns for.
+        context["note"] = (
+            f"This map is FILTERED to the {len(tables)} tables that look relevant to this "
+            f"question, out of {sl.omitted_table_count + len(tables)} in the schema. "
+            "'other_tables' lists names that were left out. If the question needs one of them, "
+            "say so in \"explanation\" and set \"sql\" to \"\" — never guess a table's columns "
+            "from its name."
+        )
+        context["other_tables"] = sl.omitted_tables
+        if sl.omitted_table_count > len(sl.omitted_tables):
+            context["other_tables_not_listed"] = sl.omitted_table_count - len(sl.omitted_tables)
+        if sl.omitted_program_count:
+            context["programs_not_shown"] = sl.omitted_program_count
+    return context
 
 
 def _history_block(history: list[Turn]) -> str:
@@ -448,14 +480,34 @@ def _history_block(history: list[Turn]) -> str:
     return "\n".join(lines)
 
 
+def map_slice_for(
+    question: str,
+    report: ScanReport,
+    *,
+    history: list[Turn] | None = None,
+    max_tables: int = DEFAULT_MAX_TABLES,
+) -> MapSlice:
+    """The part of the map this question needs — computed once, reused by ask and by repair."""
+    return select_map_slice(
+        report,
+        question,
+        history_sql=[t.sql for t in (history or []) if t.sql],
+        max_tables=max_tables,
+    )
+
+
 def build_ask_prompt(
     question: str,
     report: ScanReport,
     *,
     use_dba: bool = False,
     history: list[Turn] | None = None,
+    max_tables: int = DEFAULT_MAX_TABLES,
+    sl: MapSlice | None = None,
 ) -> str:
-    context = json.dumps(build_schema_context(report), indent=2, default=str)
+    if sl is None:
+        sl = map_slice_for(question, report, history=history, max_tables=max_tables)
+    context = json.dumps(build_schema_context(report, sl), indent=2, default=str)
     catalog = catalog_reference(use_dba)
     convo = ""
     if history:
@@ -550,8 +602,12 @@ def build_repair_prompt(
     report: ScanReport,
     *,
     use_dba: bool = False,
+    max_tables: int = DEFAULT_MAX_TABLES,
 ) -> str:
-    context = json.dumps(build_schema_context(report), indent=2, default=str)
+    # The query being repaired is the best statement of what it needs: every table it already
+    # names is pinned into the slice, so a fix can never lose one of them.
+    sl = select_map_slice(report, question, history_sql=[sql], max_tables=max_tables)
+    context = json.dumps(build_schema_context(report, sl), indent=2, default=str)
     language = (
         "Romanian (romana)" if _looks_romanian(question) else "the same language as the question"
     )
@@ -642,6 +698,7 @@ def repair_invalid_sql(
     provider: object,
     check: Callable[[str], str | None],
     use_dba: bool = False,
+    max_tables: int = DEFAULT_MAX_TABLES,
 ) -> AskResult:
     """Compile-check the proposed SQL and, if Oracle rejects it, let the model fix it once.
 
@@ -655,7 +712,9 @@ def repair_invalid_sql(
     generate = getattr(provider, "generate", None)
     if generate is None:
         return result.model_copy(update={"warnings": [*result.warnings, _repair_note(error)]})
-    prompt = build_repair_prompt(question, result.sql, error, report, use_dba=use_dba)
+    prompt = build_repair_prompt(
+        question, result.sql, error, report, use_dba=use_dba, max_tables=max_tables
+    )
     try:
         repaired = parse_ask_response(generate(REPAIR_SYSTEM_PROMPT, prompt))
     except Exception:  # noqa: BLE001 - a failed repair must not lose the original answer
